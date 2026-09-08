@@ -862,7 +862,7 @@
     <div class="brand">
       <span class="mark">◆ BORDERFORGE</span>
       <span>TACTICAL CONQUEST</span>
-      <span class="sub">// TACTICAL COMMAND v1.0</span>
+      <span class="sub">// TACTICAL COMMAND · PHASE 2</span>
     </div>
     <div class="header-right">
       <span><span class="status-dot"></span>OPERATIONAL</span>
@@ -1240,6 +1240,7 @@
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
       <button class="btn" onclick="exportCurrentSaveFile()">⬇ Export Save File</button>
       <label class="btn" style="display:inline-flex;align-items:center;justify-content:center;cursor:pointer;">⬆ Import Save File<input id="importSaveInput" type="file" accept="application/json,.json" style="display:none"></label>
+      <button class="btn" onclick="clearBorderforgeDiagnostics()" title="Clears optional balance/telemetry history only; save slots are preserved">Clear Old Diagnostics</button>
       <button class="btn primary" onclick="closeModalById('saveManagerModal')">Close</button>
     </div>
   </div>
@@ -2452,6 +2453,57 @@ function peekSave() {
   } catch (e) { return null; }
 }
 
+// Build a gameplay save without transient telemetry records. Those records are
+// useful for balance analysis but are not required to resume a match and can
+// become large in long sessions.
+function buildGameplaySavePayload() {
+  if (!state) return null;
+  const payload = { ...state, savedAt: new Date().toISOString(), schemaVersion: SAVE_SCHEMA };
+  delete payload._currentAITurnRecord;
+  delete payload._currentHumanTurnRecord;
+  return payload;
+}
+
+function isStorageQuotaError(e) {
+  return !!e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || /quota/i.test(String(e.message||'')));
+}
+
+// Store a save, prioritizing the actual game over optional balance telemetry.
+// If the origin is full, discard only the diagnostic telemetry dataset and
+// retry. Player save slots, settings, favorites and multiplayer tokens remain.
+function storeSaveRaw(key, raw) {
+  try {
+    localStorage.setItem(key, raw);
+    return { ok:true, clearedDiagnostics:false };
+  } catch (e) {
+    if (!isStorageQuotaError(e)) return { ok:false, error:e, clearedDiagnostics:false };
+    let cleared = false;
+    try {
+      if (localStorage.getItem('borderforge_telemetry') !== null) {
+        localStorage.removeItem('borderforge_telemetry');
+        cleared = true;
+        if (window.__telemetry) {
+          window.__telemetry.games = [];
+          window.__telemetry.storageFull = false;
+        }
+      }
+    } catch (_) {}
+    try {
+      localStorage.setItem(key, raw);
+      return { ok:true, clearedDiagnostics:cleared };
+    } catch (retryError) {
+      return { ok:false, error:retryError, clearedDiagnostics:cleared };
+    }
+  }
+}
+
+function saveFailureMessage(e) {
+  if (isStorageQuotaError(e)) {
+    return 'Browser storage is full, so this slot could not be saved. Your current game is still running. Use Export Save File for an immediate backup, or delete an older save slot and try again.';
+  }
+  return 'Save failed: ' + (e?.message || e || 'Unknown error');
+}
+
 function saveGame() {
   if (!state || state.gameOver === undefined) {
     log('SYSTEM', 'Nothing to save — no active game.', 'system');
@@ -2467,20 +2519,24 @@ function saveGame() {
     return false;
   }
   try {
-    // Stamp the save time so the resume button can show "saved 3 min ago".
-    const payload = { ...state, savedAt: new Date().toISOString() };
-    // map.adjacency is an array of arrays (plain JSON) — fine to clone.
-    // truces is an object with string keys → numbers — also fine.
-    // No circular refs in state, so JSON.stringify is safe without a replacer.
-    localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
+    // Remove an obsolete duplicate autosave key used by earlier builds. The
+    // canonical Resume/Autosave snapshot now lives only at SAVE_KEY.
+    try { localStorage.removeItem('borderforge_v1_autosave'); } catch (_) {}
+    const raw = JSON.stringify(buildGameplaySavePayload());
+    const result = storeSaveRaw(SAVE_KEY, raw);
+    if (!result.ok) {
+      log('SYSTEM', saveFailureMessage(result.error), 'system');
+      return false;
+    }
+    if (result.clearedDiagnostics) {
+      log('SYSTEM', 'Storage was full, so old balance/telemetry diagnostics were cleared to make room for the save.', 'system');
+      try { refreshTelemetryHeader(); } catch (_) {}
+    }
     log('SYSTEM', `Game saved (turn ${state.turn}).`, 'system');
-    // Trigger a re-render so the load-button enables if it was disabled.
     render();
     return true;
   } catch (e) {
-    // QuotaExceededError is the main failure here — localStorage is ~5MB per
-    // origin, and a campaign-scale save is ~30-80KB, so this should be rare.
-    log('SYSTEM', `Save failed: ${e.message}`, 'system');
+    log('SYSTEM', saveFailureMessage(e), 'system');
     return false;
   }
 }
@@ -11047,14 +11103,63 @@ function runControlledBlitz(){
 // ---- Multi-slot saves, autosave and portable save files ----
 const V4_SAVE_SLOTS=['autosave','slot1','slot2','slot3'];
 function v4SlotKey(slot){return `borderforge_v1_${slot}`;}
-function saveToSlot(slot,silent=false){if(!state)return false;try{const payload={...state,savedAt:new Date().toISOString(),schemaVersion:SAVE_SCHEMA};localStorage.setItem(v4SlotKey(slot),JSON.stringify(payload));if(slot==='autosave')localStorage.setItem(SAVE_KEY,JSON.stringify(payload));if(!silent)log('SYSTEM',`${slot==='autosave'?'Autosave':slot.toUpperCase()} saved (turn ${state.turn}).`,'system');return true;}catch(e){if(!silent)alert('Save failed: '+e.message);return false;}}
-function readSlotMeta(slot){try{const x=JSON.parse(localStorage.getItem(v4SlotKey(slot))||'null');return x?{turn:x.turn,length:x.gameLength,scenario:x.scenario||'standard',seed:x.mapSeed,savedAt:x.savedAt}:null;}catch(e){return null;}}
-function renderSaveManager(){const el=document.getElementById('saveSlotsList');if(!el)return;el.innerHTML=V4_SAVE_SLOTS.map(slot=>{const m=readSlotMeta(slot),label=slot==='autosave'?'AUTOSAVE':slot.toUpperCase();return `<div style="display:flex;gap:8px;align-items:center;border-bottom:1px dotted rgba(138,155,130,.2);padding:8px 0;"><div style="flex:1"><b style="color:var(--accent)">${label}</b><div style="font-size:10px;color:var(--ink-dim)">${m?`Turn ${m.turn} · ${scenarioLabel(m.scenario)} · Seed ${escapeHtml(m.seed||'—')} · ${new Date(m.savedAt).toLocaleString()}`:'Empty'}</div></div><button class="btn" onclick="saveToSlot('${slot}');renderSaveManager()">Save</button><button class="btn" ${m?'':'disabled'} onclick="loadFromSlot('${slot}')">Load</button><button class="btn" ${m?'':'disabled'} onclick="deleteSlot('${slot}');renderSaveManager()">×</button></div>`;}).join('');}
-function openSaveManager(){renderSaveManager();document.getElementById('saveManagerModal')?.classList.add('show');}
-function loadFromSlot(slot){try{const raw=localStorage.getItem(v4SlotKey(slot));if(!raw)return;localStorage.setItem(SAVE_KEY,raw);closeModalById('saveManagerModal');loadGame();applyDisplaySettings(state.displaySettings||{},true);}catch(e){alert('Could not load slot: '+e.message);}}
-function deleteSlot(slot){try{localStorage.removeItem(v4SlotKey(slot));}catch(e){}}
-function exportCurrentSaveFile(){if(!state)return;const blob=new Blob([JSON.stringify({...state,savedAt:new Date().toISOString()},null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`borderforge_v1_save_turn_${state.turn}.json`;a.click();URL.revokeObjectURL(url);}
-function importSaveFile(file){if(!file)return;const r=new FileReader();r.onload=()=>{try{const obj=JSON.parse(r.result);if(!obj||obj.schemaVersion!==SAVE_SCHEMA||!obj.map||!obj.players)throw new Error('Not a compatible v5 save file.');localStorage.setItem(v4SlotKey('slot1'),JSON.stringify(obj));localStorage.setItem(SAVE_KEY,JSON.stringify(obj));loadGame();applyDisplaySettings(state.displaySettings||{},true);closeModalById('saveManagerModal');}catch(e){alert('Import failed: '+e.message);}};r.readAsText(file);}
+function v4RawForSlot(slot){
+  try { return localStorage.getItem(slot==='autosave' ? SAVE_KEY : v4SlotKey(slot)); }
+  catch(e){ return null; }
+}
+function saveToSlot(slot,silent=false){
+  if(!state)return false;
+  try{
+    // Earlier builds stored AUTOSAVE twice. Remove that duplicate before every
+    // save so one game snapshot cannot consume the quota twice.
+    try{localStorage.removeItem(v4SlotKey('autosave'));}catch(_){}
+    const raw=JSON.stringify(buildGameplaySavePayload());
+    const key=slot==='autosave'?SAVE_KEY:v4SlotKey(slot);
+    const result=storeSaveRaw(key,raw);
+    if(!result.ok){if(!silent)alert(saveFailureMessage(result.error));return false;}
+    if(result.clearedDiagnostics){
+      log('SYSTEM','Storage was full, so old balance/telemetry diagnostics were cleared to make room for your save.','system');
+      try{refreshTelemetryHeader();}catch(_){}
+    }
+    if(!silent)log('SYSTEM',`${slot==='autosave'?'Autosave':slot.toUpperCase()} saved (turn ${state.turn}).`,'system');
+    return true;
+  }catch(e){if(!silent)alert(saveFailureMessage(e));return false;}
+}
+function readSlotMeta(slot){try{const x=JSON.parse(v4RawForSlot(slot)||'null');return x?{turn:x.turn,length:x.gameLength,scenario:x.scenario||'standard',seed:x.mapSeed,savedAt:x.savedAt}:null;}catch(e){return null;}}
+function v4StorageSummary(){
+  try{
+    let chars=0;
+    for(let i=0;i<localStorage.length;i++){
+      const k=localStorage.key(i);if(!k||(!k.startsWith('borderforge_')&&k!==SAVE_KEY))continue;
+      chars+=(k.length+(localStorage.getItem(k)||'').length);
+    }
+    const mb=(chars*2/1024/1024).toFixed(2);
+    return `${mb} MB of BORDERFORGE browser storage currently in use`;
+  }catch(e){return 'Browser storage usage unavailable';}
+}
+function renderSaveManager(){const el=document.getElementById('saveSlotsList');if(!el)return;el.innerHTML=`<div style="font-size:10px;color:var(--ink-dim);margin:2px 0 8px;line-height:1.5;">${escapeHtml(v4StorageSummary())}. Autosave uses one canonical snapshot; optional balance telemetry is automatically discarded first if storage becomes full.</div>`+V4_SAVE_SLOTS.map(slot=>{const m=readSlotMeta(slot),label=slot==='autosave'?'AUTOSAVE':slot.toUpperCase();return `<div style="display:flex;gap:8px;align-items:center;border-bottom:1px dotted rgba(138,155,130,.2);padding:8px 0;"><div style="flex:1"><b style="color:var(--accent)">${label}</b><div style="font-size:10px;color:var(--ink-dim)">${m?`Turn ${m.turn} · ${scenarioLabel(m.scenario)} · Seed ${escapeHtml(m.seed||'—')} · ${new Date(m.savedAt).toLocaleString()}`:'Empty'}</div></div><button class="btn" onclick="saveToSlot('${slot}');renderSaveManager()">Save</button><button class="btn" ${m?'':'disabled'} onclick="loadFromSlot('${slot}')">Load</button><button class="btn" ${m?'':'disabled'} onclick="deleteSlot('${slot}');renderSaveManager()">×</button></div>`;}).join('');}
+function openSaveManager(){
+  // Clean up the obsolete duplicate autosave on sight; this immediately frees
+  // space for users upgrading from builds that wrote both keys.
+  try{localStorage.removeItem(v4SlotKey('autosave'));}catch(_){}
+  renderSaveManager();document.getElementById('saveManagerModal')?.classList.add('show');
+}
+function loadFromSlot(slot){
+  try{
+    const raw=v4RawForSlot(slot);if(!raw)return;
+    if(slot!=='autosave'){
+      const result=storeSaveRaw(SAVE_KEY,raw);
+      if(!result.ok){alert('Could not prepare this slot for loading: '+saveFailureMessage(result.error));return;}
+    }
+    closeModalById('saveManagerModal');loadGame();applyDisplaySettings(state.displaySettings||{},true);
+  }catch(e){alert('Could not load slot: '+e.message);}
+}
+function deleteSlot(slot){try{if(slot==='autosave'){localStorage.removeItem(SAVE_KEY);localStorage.removeItem(v4SlotKey('autosave'));}else localStorage.removeItem(v4SlotKey(slot));}catch(e){}}
+function clearBorderforgeDiagnostics(){
+  try{localStorage.removeItem('borderforge_telemetry');if(window.__telemetry){window.__telemetry.games=[];window.__telemetry.storageFull=false;}refreshTelemetryHeader?.();renderSaveManager();log('SYSTEM','Stored balance/telemetry diagnostics cleared. Save slots were not changed.','system');}catch(e){alert('Could not clear diagnostics: '+e.message);}
+}
+function exportCurrentSaveFile(){if(!state)return;const blob=new Blob([JSON.stringify(buildGameplaySavePayload(),null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`borderforge_v1_save_turn_${state.turn}.json`;a.click();URL.revokeObjectURL(url);}
+function importSaveFile(file){if(!file)return;const r=new FileReader();r.onload=()=>{try{const obj=JSON.parse(r.result);if(!obj||obj.schemaVersion!==SAVE_SCHEMA||!obj.map||!obj.players)throw new Error('Not a compatible v5 save file.');const raw=JSON.stringify(obj);const result=storeSaveRaw(SAVE_KEY,raw);if(!result.ok)throw result.error;loadGame();applyDisplaySettings(state.displaySettings||{},true);closeModalById('saveManagerModal');}catch(e){alert('Import failed: '+saveFailureMessage(e));}};r.readAsText(file);}
 
 // ---- Narrative event early warning ----
 const V4_EVENT_LABELS={defection:'Political instability near a stronghold',arms_race:'An arms race is accelerating',martial_law:'Martial law is being prepared',tech_embargo:'A technology embargo is forming',open_frontier:'Frontier supply routes are opening'};
@@ -12585,5 +12690,1070 @@ v5InstallUI();document.getElementById('startBtn').onclick=v5StartGame;v5PreviewG
 })();
 
 </script>
+
+<style id="bf-ui-polish-v2">
+/* ============================================================
+   BORDERFORGE UI POLISH PREVIEW — presentation-only overrides
+   No game rules/network logic changed.
+   ============================================================ */
+:root{
+  --bg-0:#07111c; --bg-1:#0b1724; --bg-2:#112235;
+  --ink:#edf4f8; --ink-dim:#a9bdcb; --ink-faint:#70899a;
+  --accent:#e6b54a; --accent-hot:#ff6948;
+  --red:#ed4c5c; --blue:#4ca9ff; --green:#52ce82; --purple:#b87be8; --yellow:#efc94d;
+  --grid-line:rgba(95,145,180,.10); --panel-border:rgba(103,164,205,.30);
+}
+html,body{font-size:13px;background:#06101a;color:var(--ink)}
+body{background-image:radial-gradient(ellipse at 50% -20%,rgba(50,120,175,.20),transparent 45%),linear-gradient(rgba(65,130,175,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(65,130,175,.055) 1px,transparent 1px);background-size:100% 100%,32px 32px,32px 32px}
+body::before{opacity:.025}
+#app{padding:8px;gap:8px;background:linear-gradient(180deg,#06101a,#07131f)}
+header{min-height:64px;padding:9px 16px;border:1px solid rgba(111,174,218,.28);border-radius:8px;background:linear-gradient(180deg,rgba(17,35,52,.98),rgba(7,18,30,.98));box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.brand{gap:10px;font-size:17px;letter-spacing:.12em;white-space:nowrap}
+.brand .mark{font-size:24px;color:#f3f6f8;text-shadow:0 1px 0 #000,0 0 22px rgba(83,169,230,.18)}
+.brand .mark::first-letter{color:var(--accent)}
+.brand .sub{font-size:9px;color:#6f8b9e}
+.header-right{gap:7px;flex-wrap:wrap;justify-content:flex-end}
+.status-dot{width:7px;height:7px;box-shadow:0 0 10px var(--green)}
+.hdr-save-btn{border-color:rgba(103,164,205,.28);background:rgba(7,18,30,.65);border-radius:5px;color:#a9bdcb;padding:6px 9px;letter-spacing:.12em}
+.hdr-save-btn:hover:not(:disabled){background:rgba(76,169,255,.10);border-color:var(--blue);color:#d7ecff;box-shadow:0 0 16px rgba(76,169,255,.13)}
+#mpHeaderChip{border:1px solid rgba(76,169,255,.45);background:rgba(76,169,255,.08);padding:6px 9px;border-radius:5px;color:#bfe3ff!important}
+main{grid-template-columns:270px minmax(500px,1fr) 310px;gap:8px;background:transparent;min-height:0}
+.panel,.map-wrap{border:1px solid rgba(103,164,205,.26);border-radius:8px;background:linear-gradient(180deg,rgba(11,24,38,.98),rgba(8,18,29,.98));box-shadow:0 12px 28px rgba(0,0,0,.20);min-width:0}
+.panel{padding:14px}
+.panel h2{margin:-2px -2px 11px;padding:2px 2px 10px;border-bottom:1px solid rgba(103,164,205,.20);color:#d8e8f2;font-size:11px;letter-spacing:.16em}
+.panel h2::first-letter{color:var(--blue)}
+.panel h3{color:#86a5b8;margin:14px 0 7px}
+.player-row{padding:8px 10px;margin-bottom:5px;border:1px solid rgba(103,164,205,.12);border-left:3px solid transparent;border-radius:5px;background:rgba(15,34,52,.78)}
+.player-row.active{border-color:rgba(230,181,74,.32);border-left-color:var(--accent);background:linear-gradient(90deg,rgba(230,181,74,.15),rgba(15,34,52,.85));box-shadow:inset 0 0 25px rgba(230,181,74,.05)}
+.player-swatch{border-radius:3px;box-shadow:0 0 10px currentColor}
+.legend-item{background:rgba(255,255,255,.025);border:1px solid rgba(103,164,205,.08);padding:5px 7px}
+.map-wrap{background:radial-gradient(circle at 50% 45%,#102438 0%,#081521 65%,#06101a 100%);overflow:hidden}
+.map-wrap::before{background-image:radial-gradient(circle at 30% 35%,rgba(76,169,255,.065),transparent 42%),radial-gradient(circle at 72% 72%,rgba(230,181,74,.055),transparent 38%)}
+.region-hull{fill:rgba(76,169,255,.018);stroke:rgba(118,173,210,.33);stroke-width:1.5}
+.region-label{fill:#96aec0;font-size:11px;letter-spacing:.12em;text-shadow:0 2px 5px #000}
+.region-bonus-label{fill:var(--accent);font-size:9px}
+.territory-link{stroke:rgba(120,166,196,.30);stroke-width:1.7}
+.territory-link.highlight{stroke:#f0bd4f;stroke-width:3;filter:drop-shadow(0 0 5px rgba(240,189,79,.75))}
+.terr-bg{stroke:rgba(255,255,255,.15);stroke-width:1.3;filter:drop-shadow(0 4px 5px rgba(0,0,0,.42))}
+.terr-ring{stroke-width:2.4}
+.terr-ring.selected{stroke-width:4.5!important;filter:drop-shadow(0 0 14px currentColor)}
+.terr-ring.targetable{stroke-width:3;stroke-dasharray:5 3}
+.terr-label{font-size:12px;font-weight:800;paint-order:stroke;stroke:rgba(0,0,0,.70);stroke-width:2px;letter-spacing:.02em}
+.terr-terrain{font-size:14px}
+.stronghold-star{filter:drop-shadow(0 0 7px var(--accent))}
+.map-overlay-top{top:10px;left:10px;right:10px}
+.map-coord{border:1px solid rgba(103,164,205,.30);border-radius:4px;background:rgba(5,15,24,.84);color:#8aa7b9;padding:6px 10px}
+.map-overlay-bottom{bottom:10px;left:10px;right:10px}
+.phase-indicator{min-width:190px;border:1px solid rgba(230,181,74,.72);border-radius:5px;background:linear-gradient(180deg,rgba(48,38,17,.96),rgba(17,19,19,.96));padding:9px 14px;color:#ffd874;box-shadow:0 0 20px rgba(230,181,74,.10)}
+.phase-indicator .turn-label{color:#9cb0bc}
+.map-zoom-controls{right:10px;bottom:51px}
+.map-zoom-controls button{border-radius:4px;background:rgba(5,15,24,.88);border-color:rgba(103,164,205,.28)}
+.selection-box,.cards-panel,.combat-preview{border-radius:6px;background:rgba(15,34,52,.72);border-color:rgba(103,164,205,.23)}
+.sel-title{color:#e9f3f8}
+.btn{border-radius:5px;border-color:rgba(103,164,205,.25);background:linear-gradient(180deg,rgba(22,44,65,.92),rgba(12,27,42,.92));padding:9px 11px;letter-spacing:.13em;color:#d7e4eb}
+.btn::before{color:#71baff}
+.btn:hover:not(:disabled){background:linear-gradient(180deg,rgba(28,57,83,.98),rgba(15,36,55,.98));border-color:#5eb5f5;color:#e8f6ff;box-shadow:0 0 18px rgba(76,169,255,.12)}
+.btn.primary{background:linear-gradient(180deg,rgba(75,58,19,.96),rgba(39,31,14,.96));border-color:#d9aa43;color:#ffd66d}
+.btn.primary::before{color:#ffd66d}
+.btn.danger{border-color:rgba(237,76,92,.38)}
+.btn.danger:hover:not(:disabled){background:linear-gradient(180deg,rgba(92,27,38,.92),rgba(48,18,27,.92));border-color:#ed4c5c;color:#ff8d99}
+.trade-btn{border-radius:5px}
+#log{max-height:310px}
+.log-entry{border-bottom-color:rgba(103,164,205,.09)}
+.modal-backdrop{background:rgba(3,9,15,.90);backdrop-filter:blur(10px)}
+.modal{border:1px solid rgba(103,164,205,.38);border-top:2px solid var(--accent);border-radius:9px;background:linear-gradient(180deg,#0d1c2b,#08131f);box-shadow:0 30px 90px rgba(0,0,0,.55),0 0 60px rgba(52,125,176,.08);max-width:700px;padding:30px 34px}
+.modal::before{display:none}
+.modal h1{color:#eef5f8;text-shadow:none;letter-spacing:.13em}
+.modal .tag{color:#7da0b7}
+.modal .field{padding:11px 12px;margin:8px 0;border:1px solid rgba(103,164,205,.10);border-radius:6px;background:rgba(10,25,39,.48)}
+.modal label{color:#d5e4ed}
+.modal select,.modal input{border-radius:5px;border-color:rgba(103,164,205,.28);background:#0d2031;color:#eef5f8}
+.modal select:focus,.modal input:focus{border-color:#4ca9ff;box-shadow:0 0 0 2px rgba(76,169,255,.10)}
+.ruleset-btn,.diff-btn,.length-btn{border-radius:5px;border-color:rgba(103,164,205,.20);background:#102235;color:#aabfcc}
+.ruleset-btn.selected,.diff-btn.selected,.length-btn.selected{border-color:#e0ad43;color:#ffd36d;background:rgba(230,181,74,.11);box-shadow:inset 0 0 18px rgba(230,181,74,.05)}
+#mpSetupBlock{border-radius:7px!important;border-color:rgba(76,169,255,.42)!important;background:linear-gradient(135deg,rgba(24,66,98,.28),rgba(8,23,37,.45))!important}
+#mpSetupBlock .mp-title{color:#82c7ff!important}
+#mpRoomOutput{color:#ffd66d!important;text-shadow:0 0 12px rgba(230,181,74,.20)}
+.mp-wait-card{border-radius:6px!important;background:rgba(76,169,255,.07)!important}
+#bfShowcaseTools{margin:14px 0 0;padding:13px;border:1px solid rgba(230,181,74,.34);border-radius:7px;background:linear-gradient(135deg,rgba(230,181,74,.08),rgba(12,30,45,.55))}
+#bfShowcaseTools .bf-st-title{font-family:'Oswald',sans-serif;font-size:11px;letter-spacing:.16em;color:#ffd66d;margin-bottom:6px}
+#bfShowcaseTools .bf-st-note{font-size:10px;line-height:1.5;color:#8fa9ba;margin-bottom:9px}
+#bfShowcaseTools .bf-st-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+#bfShowcaseTools button{margin:0!important;text-align:center}
+@media(max-width:1180px){main{grid-template-columns:235px minmax(420px,1fr) 270px}.brand .sub{display:none}}
+</style>
+
+
+
+<style id="bf-ui-phase1-final">
+/* ============================================================
+   BORDERFORGE — PHASE 1 FINAL UI
+   Presentation / information architecture only.
+   Game rules, state transitions, map generation and networking are unchanged.
+   ============================================================ */
+:root{
+  --bf-navy-950:#040b12;
+  --bf-navy-900:#07121d;
+  --bf-navy-850:#0a1826;
+  --bf-navy-800:#0d2031;
+  --bf-navy-750:#11283c;
+  --bf-line:rgba(116,176,216,.24);
+  --bf-line-strong:rgba(116,176,216,.42);
+  --bf-text:#edf5fa;
+  --bf-muted:#9db4c4;
+  --bf-faint:#668296;
+  --bf-gold:#e7b649;
+  --bf-gold-hi:#ffd872;
+  --bf-red:#ef5362;
+  --bf-blue:#4daeff;
+  --bf-green:#57d78a;
+  --bf-violet:#b986ef;
+}
+html,body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:var(--bf-navy-950);
+  color:var(--bf-text);
+}
+body{
+  background-image:
+    radial-gradient(ellipse at 48% -20%,rgba(60,139,194,.18),transparent 46%),
+    linear-gradient(rgba(74,132,171,.04) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(74,132,171,.04) 1px,transparent 1px);
+  background-size:100% 100%,36px 36px,36px 36px;
+}
+body::before{opacity:.018}
+#app{padding:8px;gap:8px;background:transparent}
+
+/* --- Header / command bar --- */
+header{
+  min-height:72px;
+  padding:9px 14px;
+  gap:14px;
+  border:1px solid var(--bf-line);
+  border-radius:8px;
+  background:linear-gradient(180deg,rgba(14,32,48,.98),rgba(6,17,28,.98));
+  box-shadow:0 12px 32px rgba(0,0,0,.28);
+}
+.brand{display:flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:240px;line-height:1}
+.brand .mark{
+  font-family:"Arial Narrow","Segoe UI",sans-serif;
+  font-size:21px;font-weight:800;letter-spacing:.12em;color:#f5f8fa;
+  text-shadow:0 0 22px rgba(91,175,232,.12)
+}
+.brand .mark::first-letter{color:var(--bf-gold)}
+.brand .sub{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:8px;letter-spacing:.3em;color:#718da1;margin-left:29px}
+#bfPhaseRibbon{display:flex;align-items:stretch;gap:5px;min-width:380px;max-width:520px;flex:1;justify-content:center}
+.bf-phase-step{
+  min-width:0;flex:1;display:flex;align-items:center;justify-content:center;gap:7px;
+  padding:9px 10px;border:1px solid rgba(115,169,204,.17);border-radius:5px;
+  background:rgba(10,25,39,.55);color:#667f91;
+  font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:700;font-size:10px;letter-spacing:.12em;
+  transition:border-color .15s,background .15s,color .15s;
+}
+.bf-phase-step .bf-phase-icon{font-size:13px}.bf-phase-step .bf-phase-num{font:700 8px ui-monospace,monospace;opacity:.65}
+.bf-phase-step.active[data-phase="reinforce"]{color:#ffd878;border-color:rgba(231,182,73,.75);background:linear-gradient(180deg,rgba(94,71,21,.48),rgba(31,27,18,.55));box-shadow:inset 0 -2px 0 var(--bf-gold)}
+.bf-phase-step.active[data-phase="attack"]{color:#ff909a;border-color:rgba(239,83,98,.75);background:linear-gradient(180deg,rgba(94,28,39,.48),rgba(34,19,25,.55));box-shadow:inset 0 -2px 0 var(--bf-red)}
+.bf-phase-step.active[data-phase="fortify"]{color:#8fcbff;border-color:rgba(77,174,255,.75);background:linear-gradient(180deg,rgba(27,64,96,.52),rgba(17,30,44,.55));box-shadow:inset 0 -2px 0 var(--bf-blue)}
+.bf-phase-step.past{color:#87a0b1;border-color:rgba(116,176,216,.25);background:rgba(16,36,52,.72)}
+.header-right{gap:5px;flex-wrap:wrap;justify-content:flex-end;min-width:0}
+.header-right>span:not(.hdr-save-wrap){
+  min-height:29px;display:inline-flex;align-items:center;padding:5px 8px;border:1px solid rgba(116,176,216,.18);border-radius:4px;
+  background:rgba(6,18,29,.60);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:8px;letter-spacing:.11em;color:#8ea8b8
+}
+.header-right #mpHeaderChip{border-color:rgba(77,174,255,.42)!important;background:rgba(77,174,255,.08)!important;color:#bfe4ff!important}
+.hdr-save-wrap{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.hdr-save-btn{
+  padding:6px 8px;border-radius:4px;border-color:rgba(116,176,216,.20);background:rgba(7,19,30,.72);
+  font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:700;font-size:8px;letter-spacing:.10em;color:#9db5c5
+}
+.hdr-save-btn:hover:not(:disabled){color:#e3f3ff;border-color:rgba(77,174,255,.65);background:rgba(77,174,255,.10);box-shadow:none}
+
+/* --- Main command workspace --- */
+main{grid-template-columns:260px minmax(520px,1fr) 305px;gap:8px;background:transparent;min-height:0}
+.panel,.map-wrap{border:1px solid var(--bf-line);border-radius:8px;background:linear-gradient(180deg,rgba(9,24,37,.98),rgba(6,17,28,.98));box-shadow:0 12px 28px rgba(0,0,0,.19)}
+.panel{padding:13px}
+.panel h2{
+  position:sticky;top:-13px;z-index:3;margin:-13px -13px 11px;padding:12px 13px 10px;
+  border-bottom:1px solid rgba(116,176,216,.22);background:linear-gradient(180deg,#0d2132,#091a29);
+  font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800;font-size:10px;letter-spacing:.16em;color:#dbeaf3
+}
+.panel h3{font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800;font-size:9px;letter-spacing:.16em;color:#7896aa;margin:15px 0 7px}
+#leftPanel,#rightPanel{scrollbar-color:#29455a #07131e;scrollbar-width:thin}
+.player-row{padding:8px 9px;margin-bottom:5px;border:1px solid rgba(116,176,216,.11);border-left:3px solid transparent;border-radius:5px;background:rgba(13,31,47,.75)}
+.player-row.active{border-color:rgba(231,182,73,.34);border-left-color:var(--bf-gold);background:linear-gradient(90deg,rgba(231,182,73,.13),rgba(13,31,47,.86))}
+.player-name{font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:700;font-size:11px;letter-spacing:.03em}
+.player-stats,.v5-trust{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#88a2b4}
+.legend-item{padding:5px 7px;background:rgba(255,255,255,.025);border:1px solid rgba(116,176,216,.07);border-radius:4px}
+.legend-effect{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#89a2b3}
+#victoryConditions,#turnOrderSummary,#regionSummary,#log{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.player-row{display:grid!important;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:2px 8px}
+.player-row .player-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.player-row .player-stats{white-space:nowrap;align-self:start}
+.player-row>.bf-row-meta{grid-column:1/-1;min-width:0}
+.player-row>.bf-row-signal{display:inline-block!important;width:auto!important;margin:1px 9px 0 0!important;font-size:7px!important;line-height:1.2!important;letter-spacing:.07em!important}
+.player-row>.bf-grudge{height:3px!important;margin:3px 0 1px!important}
+
+
+/* --- Battlefield visual layer --- */
+.map-wrap{
+  background:
+    radial-gradient(circle at 48% 45%,rgba(24,58,83,.60),rgba(7,20,31,.96) 67%),
+    linear-gradient(30deg,rgba(104,159,194,.025) 12%,transparent 12.5%,transparent 87%,rgba(104,159,194,.025) 87.5%);
+  background-size:100% 100%,64px 112px;
+}
+.map-wrap::before{opacity:1;background-image:radial-gradient(circle at 24% 26%,rgba(77,174,255,.05),transparent 33%),radial-gradient(circle at 73% 75%,rgba(231,182,73,.04),transparent 34%)}
+.map-wrap::after{content:"";position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 70px rgba(0,0,0,.24)}
+.region-hull{stroke-width:1.5;fill:rgba(88,151,194,.018);filter:drop-shadow(0 0 5px rgba(55,126,174,.04))}
+.region-label{font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800;font-size:10px;letter-spacing:.14em;fill:#91aabc;paint-order:stroke;stroke:rgba(5,15,24,.85);stroke-width:3px}
+.region-bonus-label{font:700 8px ui-monospace,SFMono-Regular,Consolas,monospace;fill:var(--bf-gold);paint-order:stroke;stroke:rgba(5,15,24,.85);stroke-width:2px}
+.territory-link{stroke:rgba(112,158,188,.27);stroke-width:1.6;transition:stroke .15s,stroke-width .15s}
+.territory-link.highlight{stroke:var(--bf-gold)!important;stroke-width:3!important;stroke-dasharray:none!important;filter:drop-shadow(0 0 5px rgba(231,182,73,.7))}
+.terr-bg{stroke:rgba(255,255,255,.20);stroke-width:1.2;filter:drop-shadow(0 4px 7px rgba(0,0,0,.55))}
+.terr-ring{stroke-width:2.2}.terr-ring.selected{stroke-width:4.2!important;filter:drop-shadow(0 0 12px currentColor)}.terr-ring.targetable{stroke-width:3;stroke-dasharray:4 3}
+.terr-label{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;font-weight:800;paint-order:stroke;stroke:rgba(0,0,0,.75);stroke-width:3px}
+.terr-terrain{font-size:13px}.stronghold-star{filter:drop-shadow(0 0 8px var(--bf-gold))}
+.bf-territory-name{font-family:"Arial Narrow","Segoe UI",sans-serif;font-size:8px;font-weight:700;letter-spacing:.07em;fill:#8da8ba;text-anchor:middle;paint-order:stroke;stroke:rgba(4,12,20,.95);stroke-width:3px;pointer-events:none;opacity:.28}
+.bf-territory-name.bf-key-territory{opacity:.72;fill:#a9c1d0}.terr-node:hover .bf-territory-name,.terr-node:focus .bf-territory-name{fill:#e8f3f9;opacity:1}
+.map-overlay-top{top:10px;left:10px;right:10px}.map-overlay-bottom{bottom:10px;left:10px;right:10px}
+.map-coord{border:1px solid rgba(116,176,216,.27);border-radius:4px;background:rgba(4,15,24,.80);color:#87a2b4;padding:6px 9px;font:700 8px ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.12em}
+.phase-indicator{min-width:176px;border:1px solid rgba(231,182,73,.70);border-radius:5px;background:linear-gradient(180deg,rgba(60,47,17,.92),rgba(20,20,18,.92));padding:8px 12px;color:#ffd873;box-shadow:0 0 18px rgba(231,182,73,.08);font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800}
+.phase-indicator .turn-label{font:700 8px ui-monospace,SFMono-Regular,Consolas,monospace;color:#91a8b6}
+.v5-map-tools{top:10px!important;left:50%!important;transform:translateX(-50%);right:auto!important;border-radius:5px!important;background:rgba(4,15,24,.75)!important;border:1px solid rgba(116,176,216,.20)!important;padding:3px!important;backdrop-filter:blur(5px)}
+.v5-map-tools button{border-radius:3px!important;border:0!important;background:transparent!important;color:#7894a7!important;font-family:"Arial Narrow","Segoe UI",sans-serif!important;font-weight:700!important;letter-spacing:.08em!important;padding:5px 7px!important}
+.v5-map-tools button.active{background:rgba(231,182,73,.14)!important;color:#ffd56a!important;box-shadow:inset 0 -1px 0 rgba(231,182,73,.65)}
+.map-zoom-controls{right:10px;bottom:50px}.map-zoom-controls button{background:rgba(4,15,24,.86);border-color:rgba(116,176,216,.26);border-radius:4px;color:#b2c6d3}
+
+/* --- Tactical cards & controls --- */
+.selection-box,.cards-panel,.combat-preview,.advisor-box{border-radius:6px!important;background:linear-gradient(180deg,rgba(17,39,58,.78),rgba(10,25,39,.82))!important;border:1px solid rgba(116,176,216,.22)!important;box-shadow:none!important}
+.sel-title{font-family:"Arial Narrow","Segoe UI",sans-serif;font-size:14px;font-weight:800;letter-spacing:.06em;color:#edf6fb}
+.sel-row{padding:4px 0;border-bottom:1px solid rgba(116,176,216,.07)}.sel-row:last-child{border-bottom:0}.sel-row span{color:#829cad}.sel-row b{color:#e4eef4}
+.cards-panel h3,.research-panel h3{font-family:"Arial Narrow","Segoe UI",sans-serif}
+.combat-preview{border-color:rgba(239,83,98,.62)!important;background:linear-gradient(180deg,rgba(66,21,31,.52),rgba(12,27,41,.88))!important}
+.combat-preview::before{font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800;color:#ff7f8a;border-bottom-style:solid}
+.cp-side .cp-terr{font-family:"Arial Narrow","Segoe UI",sans-serif;font-size:13px;font-weight:800}.cp-side .cp-val{font-size:20px}.cp-stat{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.btn{border-radius:5px;border-color:rgba(116,176,216,.24);background:linear-gradient(180deg,rgba(22,48,70,.94),rgba(10,28,43,.94));padding:9px 10px;font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800;font-size:10px;letter-spacing:.11em;color:#d7e7f0}
+.btn::before{color:#6cbcff}.btn:hover:not(:disabled){border-color:rgba(77,174,255,.70);background:linear-gradient(180deg,rgba(30,64,92,.96),rgba(13,35,53,.96));color:#f1f9ff;box-shadow:none}
+.btn.primary{border-color:rgba(231,182,73,.72);background:linear-gradient(180deg,rgba(80,61,19,.92),rgba(40,33,17,.95));color:#ffdc78}.btn.primary::before{color:#ffdc78}
+.btn.danger{border-color:rgba(239,83,98,.48);background:linear-gradient(180deg,rgba(70,25,35,.82),rgba(31,20,27,.90));color:#ffb0b7}.btn.danger::before{color:#ff6f7c}
+#actionButtons .bf-action-attack{border-color:rgba(239,83,98,.55);color:#ffadb5}#actionButtons .bf-action-attack::before{color:var(--bf-red)}
+#actionButtons .bf-action-fortify{border-color:rgba(77,174,255,.48);color:#b5ddff}#actionButtons .bf-action-fortify::before{color:var(--bf-blue)}
+#actionButtons .bf-action-reinforce{border-color:rgba(231,182,73,.48);color:#ffdc7f}#actionButtons .bf-action-reinforce::before{color:var(--bf-gold)}
+#actionButtons .bf-action-end{border-color:rgba(87,215,138,.44);color:#a9efc4}#actionButtons .bf-action-end::before{color:var(--bf-green)}
+#actionButtons .bf-action-diplomacy{border-color:rgba(185,134,239,.40);color:#d9baf8}#actionButtons .bf-action-diplomacy::before{color:var(--bf-violet)}
+#log{max-height:320px}.log-entry{padding:5px 0;border-bottom:1px solid rgba(116,176,216,.07);line-height:1.45}.log-prefix{font-weight:800}
+
+/* --- Setup / multiplayer lobby --- */
+#setupModal{padding:18px 0;background:rgba(2,8,14,.92);backdrop-filter:blur(12px)}
+#setupModal>.modal.bf-setup-modal{
+  width:min(1120px,calc(100vw - 36px));max-width:1120px;max-height:calc(100vh - 36px);padding:0;
+  border:1px solid rgba(116,176,216,.38);border-top:2px solid var(--bf-gold);border-radius:10px;overflow:hidden;
+  background:linear-gradient(180deg,#0b1e2e,#071522);box-shadow:0 32px 100px rgba(0,0,0,.60),0 0 80px rgba(52,125,176,.06)
+}
+.bf-setup-scroll{overflow-y:auto;max-height:calc(100vh - 118px);padding:24px 26px 20px;scrollbar-width:thin;scrollbar-color:#2b4e67 #071522}
+.bf-setup-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:end;padding-bottom:16px;margin-bottom:16px;border-bottom:1px solid rgba(116,176,216,.18)}
+.bf-setup-hero-main h1{font-family:"Arial Narrow","Segoe UI",sans-serif!important;font-size:29px!important;font-weight:900;letter-spacing:.15em!important;color:#f4f8fa!important;margin:0!important}
+.bf-setup-hero-main .tag{margin:4px 0 8px!important;color:#7592a6!important;font:700 9px ui-monospace,SFMono-Regular,Consolas,monospace!important;letter-spacing:.24em!important}
+.bf-setup-hero .setup-note{margin:0!important;font:500 9px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace!important;color:#607c91!important}
+.bf-setup-objective{max-width:540px;color:#b4c7d3;font-size:11px;line-height:1.55;margin:0!important}.bf-setup-objective b{color:#edf5f9}
+.bf-setup-summary{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-content:flex-end;max-width:390px}
+.bf-setup-chip{padding:6px 8px;border:1px solid rgba(116,176,216,.22);border-radius:4px;background:rgba(11,31,48,.70);font:700 8px ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.08em;color:#91adbe;white-space:nowrap}.bf-setup-chip b{color:#e8c15d}
+.bf-setup-columns{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+.bf-setup-section{border:1px solid rgba(116,176,216,.16);border-radius:7px;background:rgba(7,23,36,.58);padding:12px}
+.bf-setup-section-title{display:flex;align-items:center;justify-content:space-between;margin:-2px 0 9px;padding-bottom:8px;border-bottom:1px solid rgba(116,176,216,.14);font-family:"Arial Narrow","Segoe UI",sans-serif;font-size:10px;font-weight:800;letter-spacing:.16em;color:#b8cfdd;text-transform:uppercase}.bf-setup-section-title span{color:#59798e;font:700 8px ui-monospace,monospace;letter-spacing:.08em}
+#setupModal .field{padding:9px 10px!important;margin:6px 0!important;border:1px solid rgba(116,176,216,.10)!important;border-radius:5px!important;background:rgba(10,29,44,.48)!important}
+#setupModal .field>label:first-child{font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800;color:#a9c0cf;font-size:9px;letter-spacing:.13em;margin-bottom:6px}
+#setupModal .setup-note{font:500 9px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;color:#7792a4;margin-top:6px}
+#setupModal select,#setupModal input{min-height:38px;border:1px solid rgba(116,176,216,.27);border-radius:4px;background:#0d263a;color:#edf5f9;font:500 11px ui-monospace,SFMono-Regular,Consolas,monospace;padding:8px 10px}
+#setupModal select:focus,#setupModal input:focus{outline:0;border-color:rgba(77,174,255,.75);box-shadow:0 0 0 2px rgba(77,174,255,.10)}
+.ruleset-grid,.difficulty-grid{gap:5px}.ruleset-btn,.diff-btn,.length-btn{min-height:34px;border-radius:4px;background:#10283d;border-color:rgba(116,176,216,.18);color:#8fa8b9;font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:800;letter-spacing:.08em}.ruleset-btn.selected,.diff-btn.selected,.length-btn.selected{border-color:rgba(231,182,73,.78);background:linear-gradient(180deg,rgba(73,57,22,.68),rgba(24,29,30,.76));color:#ffda70;box-shadow:inset 0 -2px 0 rgba(231,182,73,.52)}
+.bf-advanced-section{margin-top:14px;border:1px solid rgba(116,176,216,.16);border-radius:7px;background:rgba(7,23,36,.58);padding:12px}.bf-advanced-grid{display:grid;grid-template-columns:1.12fr .88fr;gap:12px;align-items:start}
+#v5GeneratorBlock{margin:0!important}#v5GeneratorBlock>.field:first-child{margin-top:0!important;padding-top:9px!important;border-top:1px solid rgba(116,176,216,.10)!important}.v5-gen-grid{gap:6px}.v5-gen-grid label{font-size:8px!important;color:#7894a6!important}.v5-code-row{align-items:stretch}
+#mpSetupBlock{margin:0!important;padding:12px!important;border:1px solid rgba(77,174,255,.38)!important;border-radius:6px!important;background:linear-gradient(145deg,rgba(24,69,102,.26),rgba(7,24,38,.64))!important}#mpSetupBlock .mp-title{font-family:"Arial Narrow","Segoe UI",sans-serif!important;font-weight:800!important;color:#8dd0ff!important}.mp-wait-card{border-radius:5px!important}.mp-row{gap:6px!important}#mpRoomOutput{font-family:ui-monospace,SFMono-Regular,Consolas,monospace!important;font-size:24px!important;color:#ffdb72!important}
+.bf-setup-footer{position:sticky;bottom:0;z-index:8;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 20px;border-top:1px solid rgba(116,176,216,.24);background:linear-gradient(180deg,rgba(8,24,37,.98),rgba(5,16,26,.99));box-shadow:0 -10px 30px rgba(0,0,0,.20)}
+.bf-setup-footer-note{font:600 9px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;color:#6f8b9e}.bf-setup-footer-note b{color:#b7cedb}
+#setupModal #startBtn{width:auto;min-width:260px;margin:0!important;padding:11px 20px;font-size:11px;text-align:center}
+#resumeSection{border-radius:6px!important;background:rgba(231,182,73,.07)!important;border-color:rgba(231,182,73,.45)!important}
+
+/* --- Generic modals --- */
+.modal-backdrop:not(#setupModal){background:rgba(2,8,14,.90);backdrop-filter:blur(10px)}
+.modal-backdrop:not(#setupModal) .modal{border:1px solid rgba(116,176,216,.36);border-top:2px solid var(--bf-gold);border-radius:9px;background:linear-gradient(180deg,#0c2031,#071522);box-shadow:0 30px 90px rgba(0,0,0,.58);padding:28px 32px}
+.modal-backdrop:not(#setupModal) .modal h1{font-family:"Arial Narrow","Segoe UI",sans-serif;font-weight:900;color:#f2f7fa;text-shadow:none}.modal-backdrop:not(#setupModal) .modal .tag{color:#708ca0}
+
+/* --- Accessibility / focus --- */
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid rgba(77,174,255,.85)!important;outline-offset:2px}
+@media (prefers-reduced-motion:reduce){.status-dot,.terr-ring.targetable,.ai-lockout-bars span{animation:none!important}}
+@media(max-width:1380px){main{grid-template-columns:230px minmax(460px,1fr) 275px}.brand{min-width:205px}.brand .mark{font-size:18px}#bfPhaseRibbon{min-width:300px}.bf-phase-step{font-size:9px;padding:8px 7px}.hdr-save-btn{padding:5px 6px}.panel{padding:10px}.panel h2{top:-10px;margin:-10px -10px 10px;padding:10px}}
+@media(max-width:1120px){#bfPhaseRibbon .bf-phase-num{display:none}.header-right #hdrMap{display:none}main{grid-template-columns:210px minmax(420px,1fr) 250px}.bf-setup-columns,.bf-advanced-grid{grid-template-columns:1fr}.bf-setup-hero{grid-template-columns:1fr}.bf-setup-summary{justify-content:flex-start;max-width:none}}
+</style>
+<script id="bf-ui-phase1-final-js">
+(function(){
+  'use strict';
+  const NS='http://www.w3.org/2000/svg';
+  function rgba(hex,a){
+    if(!hex||typeof hex!=='string') return `rgba(116,176,216,${a})`;
+    const h=hex.trim().replace('#',''); if(!/^[0-9a-f]{6}$/i.test(h)) return `rgba(116,176,216,${a})`;
+    const n=parseInt(h,16); return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+  }
+  function installHeader(){
+    const brand=document.querySelector('.brand');
+    if(brand) brand.innerHTML='<span class="mark">◆ BORDERFORGE</span><span class="sub">// TACTICAL COMMAND</span>';
+    const header=document.querySelector('header'), right=document.querySelector('.header-right');
+    if(header&&right&&!document.getElementById('bfPhaseRibbon')){
+      const ribbon=document.createElement('div'); ribbon.id='bfPhaseRibbon'; ribbon.setAttribute('aria-label','Turn phases');
+      ribbon.innerHTML=`
+        <div class="bf-phase-step" data-phase="reinforce"><span class="bf-phase-num">01</span><span class="bf-phase-icon">●</span><span>REINFORCE</span></div>
+        <div class="bf-phase-step" data-phase="attack"><span class="bf-phase-num">02</span><span class="bf-phase-icon">⚔</span><span>ATTACK</span></div>
+        <div class="bf-phase-step" data-phase="fortify"><span class="bf-phase-num">03</span><span class="bf-phase-icon">◆</span><span>FORTIFY</span></div>`;
+      header.insertBefore(ribbon,right);
+    }
+  }
+  function installSetupLayout(){
+    const modal=document.querySelector('#setupModal>.modal'); if(!modal||modal.classList.contains('bf-setup-modal')) return;
+    modal.classList.add('bf-setup-modal');
+    const h1=modal.querySelector(':scope>h1'), tag=modal.querySelector(':scope>.tag'), legal=modal.querySelector(':scope>.setup-note'), intro=modal.querySelector(':scope>#setupIntro');
+    const scroll=document.createElement('div'); scroll.className='bf-setup-scroll';
+    const hero=document.createElement('div'); hero.className='bf-setup-hero';
+    const heroMain=document.createElement('div'); heroMain.className='bf-setup-hero-main';
+    [h1,tag,legal,intro].forEach(n=>{if(n)heroMain.appendChild(n)});
+    if(intro) intro.classList.add('bf-setup-objective');
+    const summary=document.createElement('div'); summary.className='bf-setup-summary';
+    summary.innerHTML='<span class="bf-setup-chip"><b>TURN-BASED</b> CONQUEST</span><span class="bf-setup-chip"><b>1–4</b> HUMAN COMMANDERS</span><span class="bf-setup-chip"><b>5</b> MAX TOTAL</span><span class="bf-setup-chip"><b>SEEDED</b> BATTLEFIELDS</span><span class="bf-setup-chip"><b>ONLINE</b> PRIVATE ROOMS</span>';
+    hero.append(heroMain,summary); scroll.appendChild(hero);
+    const resume=modal.querySelector(':scope>#resumeSection'); if(resume) scroll.appendChild(resume);
+    const columns=document.createElement('div'); columns.className='bf-setup-columns';
+    const match=document.createElement('section'); match.className='bf-setup-section'; match.innerHTML='<div class="bf-setup-section-title">Operation Parameters <span>MAP / RULES</span></div>';
+    const forces=document.createElement('section'); forces.className='bf-setup-section'; forces.innerHTML='<div class="bf-setup-section-title">Command Structure <span>HUMANS / AI</span></div>';
+    const leftLabels=new Set(['RULESET','GAME LENGTH','MAP SEED','OPENING DEPLOYMENT','SCENARIO','ESCALATION RULES','MAP SECTOR TYPE']);
+    const directFields=[...modal.children].filter(x=>x.classList&&x.classList.contains('field'));
+    directFields.forEach(field=>{
+      const label=(field.querySelector(':scope>label')?.textContent||'').trim().toUpperCase();
+      (leftLabels.has(label)?match:forces).appendChild(field);
+    });
+    columns.append(match,forces); scroll.appendChild(columns);
+    const advanced=document.createElement('section'); advanced.className='bf-advanced-section';
+    advanced.innerHTML='<div class="bf-setup-section-title">Advanced Systems & Multiplayer <span>GENERATOR / ROOM</span></div><div class="bf-advanced-grid"></div>';
+    const ag=advanced.querySelector('.bf-advanced-grid');
+    const gen=document.getElementById('v5GeneratorBlock'), mp=document.getElementById('mpSetupBlock');
+    if(gen) ag.appendChild(gen); if(mp) ag.appendChild(mp); if(gen||mp) scroll.appendChild(advanced);
+    modal.insertBefore(scroll,modal.firstChild);
+    const start=document.getElementById('startBtn');
+    if(start){
+      const footer=document.createElement('div');footer.className='bf-setup-footer';
+      footer.innerHTML='<div class="bf-setup-footer-note"><b>READY CHECK</b><br>Review commander count and play mode before deployment.</div>';
+      footer.appendChild(start);modal.appendChild(footer);
+    }
+  }
+  function updatePhaseRibbon(){
+    const ribbon=document.getElementById('bfPhaseRibbon'); if(!ribbon) return;
+    const order=['reinforce','attack','fortify']; const phase=(typeof state!=='undefined'&&state&&state.phase)||''; const idx=order.indexOf(phase);
+    ribbon.querySelectorAll('.bf-phase-step').forEach((el,i)=>{el.classList.toggle('active',i===idx);el.classList.toggle('past',idx>i);});
+    ribbon.style.opacity=(phase==='deployment'||phase==='capital'||!(typeof state!=='undefined'&&state))?'.55':'1';
+  }
+  function enhanceMap(){
+    if(typeof state==='undefined'||!state||!state.map) return;
+    const svg=document.getElementById('mapSvg'); if(!svg) return;
+    const hulls=[...svg.querySelectorAll('.region-hull')];
+    hulls.forEach((poly,r)=>{
+      const members=state.map.territories.filter(t=>t.region===r); if(!members.length)return;
+      const counts=new Map(); members.forEach(t=>{if(t.owner!=null)counts.set(t.owner,(counts.get(t.owner)||0)+1)});
+      let lead=null,n=0;counts.forEach((c,id)=>{if(c>n){n=c;lead=id}});
+      const owner=(lead!=null&&state.players[lead])?state.players[lead]:null; const full=n===members.length;
+      if(owner){poly.style.fill=rgba(owner.color,full?.105:.035);poly.style.stroke=rgba(owner.color,full?.58:.24)}
+    });
+    const regionLabels=[...svg.querySelectorAll('.region-label')];
+    regionLabels.forEach((label,r)=>{
+      const members=state.map.territories.filter(t=>t.region===r), owners=[...new Set(members.map(t=>t.owner))];
+      if(owners.length===1&&owners[0]!=null&&state.players[owners[0]]) label.style.fill=rgba(state.players[owners[0]].color,.90);
+    });
+    [...svg.querySelectorAll('.territory-link')].forEach((line,i)=>{
+      if(line.classList.contains('highlight')) return;
+      const pair=state.map.links[i]; if(!pair)return; const a=state.map.territories[pair[0]],b=state.map.territories[pair[1]];
+      if(a.owner!=null&&a.owner===b.owner&&state.players[a.owner]){line.style.stroke=rgba(state.players[a.owner].color,.28);line.style.strokeDasharray='none';line.style.strokeWidth='1.8'}
+      else if(a.owner!=null&&b.owner!=null&&a.owner!==b.owner){line.style.stroke='rgba(145,177,198,.33)';line.style.strokeDasharray='3 4'}
+    });
+    const showMany=state.map.territories.length<=38;
+    state.map.territories.forEach(t=>{
+      const g=svg.querySelector(`g[data-id="${t.id}"]`); if(!g)return;
+      const bg=g.querySelector('.terr-bg'), ring=g.querySelector('.terr-ring'); if(bg)bg.setAttribute('r',showMany?'19':'18.5'); if(ring)ring.setAttribute('r',showMany?'21.5':'20.5');
+      if(!g.querySelector('.bf-territory-name')&&(showMany||t.stronghold||t.isCapital||(typeof selected!=='undefined'&&selected===t.id))){
+        const tx=document.createElementNS(NS,'text');tx.setAttribute('class','bf-territory-name'+((t.stronghold||t.isCapital)?' bf-key-territory':''));tx.setAttribute('x',t.x);tx.setAttribute('y',t.y+40);tx.textContent=t.name;g.appendChild(tx);
+      }
+    });
+  }
+  function stylePlayerRows(){
+    document.querySelectorAll('#playersList .player-row').forEach(row=>{
+      const doctrine=row.querySelector('.player-name span[title="AI doctrine"]');
+      if(doctrine){const d=document.createElement('div');d.className='bf-row-meta bf-row-signal';d.textContent='DOCTRINE: '+(doctrine.textContent||'').trim();row.appendChild(d);doctrine.remove();}
+      [...row.children].slice(2).forEach(ch=>{
+        ch.classList.add('bf-row-meta');
+        const txt=(ch.textContent||'').trim().toUpperCase();
+        if(txt.startsWith('ATTITUDE:')||txt.startsWith('TRUST:')) ch.classList.add('bf-row-signal');
+        else if(ch.querySelector && ch.querySelector('div')) ch.classList.add('bf-grudge');
+      });
+    });
+  }
+  function styleActionButtons(){
+    document.querySelectorAll('#actionButtons .btn').forEach(b=>{
+      b.classList.remove('bf-action-attack','bf-action-fortify','bf-action-reinforce','bf-action-end','bf-action-diplomacy');
+      const t=b.textContent.toLowerCase();
+      if(t.includes('attack')||t.includes('blitz'))b.classList.add('bf-action-attack');
+      else if(t.includes('fortif'))b.classList.add('bf-action-fortify');
+      else if(t.includes('reinforce')||t.includes('deploy'))b.classList.add('bf-action-reinforce');
+      else if(t.includes('end ')||t.includes('end turn')||t.includes('end phase'))b.classList.add('bf-action-end');
+      else if(t.includes('diplom'))b.classList.add('bf-action-diplomacy');
+    });
+  }
+  installHeader(); installSetupLayout(); updatePhaseRibbon();
+  if(typeof window.renderHeader==='function'){const base=window.renderHeader;window.renderHeader=function(){base.apply(this,arguments);updatePhaseRibbon();};}
+  if(typeof window.renderPhase==='function'){const base=window.renderPhase;window.renderPhase=function(){base.apply(this,arguments);updatePhaseRibbon();};}
+  if(typeof window.renderMap==='function'){const base=window.renderMap;window.renderMap=function(){base.apply(this,arguments);enhanceMap();};}
+  if(typeof window.renderPlayers==='function'){const base=window.renderPlayers;window.renderPlayers=function(){base.apply(this,arguments);stylePlayerRows();};}
+  if(typeof window.renderPanel==='function'){const base=window.renderPanel;window.renderPanel=function(){base.apply(this,arguments);styleActionButtons();};}
+  // Enhance immediately if a saved game was already rendered before this layer installed.
+  if(typeof state!=='undefined'&&state){try{enhanceMap();stylePlayerRows();styleActionButtons();updatePhaseRibbon();}catch(_){}}
+})();
+</script>
+
+<style id="bfPhase2Styles">
+/* ================================================================
+   BORDERFORGE — PHASE 2 BATTLEFIELD RENDERER
+   Visual-only layer. No rules, AI, multiplayer, save, or map topology
+   logic is changed here.
+   ================================================================ */
+:root{
+  --bf2-ocean:#06131f;
+  --bf2-ocean2:#0a2030;
+  --bf2-coast:#41677c;
+  --bf2-route:#7291a2;
+  --bf2-neutral:#6f7f88;
+}
+.map-wrap{
+  background:
+    radial-gradient(circle at 50% 45%,rgba(25,61,83,.72),rgba(6,18,29,.98) 72%),
+    linear-gradient(180deg,#0a1c2a,#06111b);
+}
+#mapSvg{
+  background:
+    radial-gradient(circle at 50% 40%,rgba(47,93,119,.08),transparent 48%),
+    linear-gradient(180deg,rgba(8,31,45,.94),rgba(4,16,27,.98));
+}
+#mapSvg .region-hull,#mapSvg .region-label,#mapSvg .region-bonus-label{opacity:0!important;pointer-events:none!important}
+#mapSvg .bf2-landmass{
+  fill:#0b202c;
+  stroke:rgba(92,137,159,.52);
+  stroke-width:5;
+  stroke-linejoin:round;
+  filter:drop-shadow(0 8px 9px rgba(0,0,0,.30));
+}
+#mapSvg .bf2-landmass-inner{
+  fill:none;
+  stroke:rgba(184,219,231,.10);
+  stroke-width:1.25;
+  stroke-linejoin:round;
+  pointer-events:none;
+}
+#mapSvg .bf2-cell{
+  cursor:pointer;
+  stroke-linejoin:round;
+  vector-effect:non-scaling-stroke;
+  transition:filter .12s ease,opacity .12s ease,stroke-width .12s ease;
+}
+#mapSvg .bf2-cell:hover{filter:brightness(1.18);stroke-width:3.2!important}
+#mapSvg .bf2-cell.selected{stroke:#f3cb6c!important;stroke-width:4!important;filter:drop-shadow(0 0 7px rgba(243,203,108,.55)) brightness(1.12)}
+#mapSvg .bf2-cell.attack-target{stroke:#ff6572!important;stroke-width:4.5!important;filter:drop-shadow(0 0 8px rgba(255,74,90,.65)) brightness(1.12)}
+#mapSvg .bf2-cell.targetable{stroke:#f0c45d!important;stroke-width:3!important;stroke-dasharray:7 5}
+#mapSvg .bf2-terrain-pattern{pointer-events:none;opacity:.50}
+#mapSvg .territory-link{
+  stroke:rgba(139,176,195,.22);
+  stroke-width:1.5;
+  stroke-dasharray:3 5;
+  vector-effect:non-scaling-stroke;
+}
+#mapSvg .territory-link.highlight{stroke:#f0c45d!important;stroke-width:3!important;stroke-dasharray:none!important;filter:drop-shadow(0 0 5px rgba(240,196,93,.55))}
+#mapSvg .bf2-gateway{fill:#071522;stroke:rgba(192,219,232,.55);stroke-width:1.2;pointer-events:none}
+#mapSvg .bf2-gateway-core{fill:rgba(206,231,240,.80);pointer-events:none}
+#mapSvg .bf2-region-name{
+  font-family:"Arial Narrow","Segoe UI",sans-serif;
+  font-size:12px;font-weight:800;letter-spacing:.16em;text-anchor:middle;
+  fill:rgba(202,223,233,.34);paint-order:stroke;stroke:rgba(3,13,21,.94);stroke-width:5px;pointer-events:none
+}
+#mapSvg .bf2-region-bonus{
+  font:700 8px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.08em;text-anchor:middle;
+  fill:rgba(191,215,225,.26);paint-order:stroke;stroke:rgba(3,13,21,.94);stroke-width:4px;pointer-events:none
+}
+#mapSvg .bf2-territory-name{
+  font-family:"Arial Narrow","Segoe UI",sans-serif;font-size:8px;font-weight:800;letter-spacing:.075em;
+  text-anchor:middle;fill:rgba(211,229,237,.70);paint-order:stroke;stroke:rgba(3,12,20,.96);stroke-width:3.4px;pointer-events:none
+}
+#mapSvg .bf2-territory-name.key{font-size:9px;fill:#e3f0f5}
+#mapSvg .bf2-terrain-caption{
+  font:700 6.5px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.06em;text-anchor:middle;
+  fill:rgba(180,207,219,.46);paint-order:stroke;stroke:rgba(3,12,20,.92);stroke-width:2.7px;pointer-events:none
+}
+#mapSvg .terr-bg{stroke:rgba(255,255,255,.12)!important;stroke-width:1!important;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))}
+#mapSvg .terr-ring{stroke-width:1.5!important}
+#mapSvg .terr-ring.selected{stroke-width:3!important}
+#mapSvg .terr-label{font-size:10px!important;font-weight:800!important}
+#mapSvg .terr-terrain{font-size:10px!important;opacity:.78}
+#mapSvg .stronghold-star{display:none!important}
+#mapSvg .bf-territory-name{display:none!important}
+#mapSvg .owner-symbol{font-size:6px!important;opacity:.75!important}
+#mapSvg .bf2-stronghold{pointer-events:none;filter:drop-shadow(0 2px 3px rgba(0,0,0,.55))}
+#mapSvg .bf2-stronghold .fort-body{fill:#e7bf63;stroke:#07121b;stroke-width:1.2}
+#mapSvg .bf2-stronghold .fort-cut{fill:#07121b}
+#mapSvg .bf2-capital-ring{fill:none;stroke:#ffd978;stroke-width:2;stroke-dasharray:3 2;pointer-events:none;filter:drop-shadow(0 0 4px rgba(255,217,120,.52))}
+#mapSvg .bf2-attack-vector{fill:none;stroke:#ff5b67;stroke-width:4;stroke-linecap:round;stroke-dasharray:8 5;vector-effect:non-scaling-stroke;pointer-events:none;filter:drop-shadow(0 0 5px rgba(255,72,84,.50))}
+#mapSvg .bf2-attack-vector.secondary{stroke:#d9a94f;stroke-width:2.2;opacity:.38;stroke-dasharray:5 6;filter:none}
+#mapSvg .bf2-selection-halo{fill:none;stroke:#f3cb6c;stroke-width:1.5;stroke-dasharray:3 3;opacity:.72;pointer-events:none;vector-effect:non-scaling-stroke}
+.map-coord{border-color:rgba(92,149,181,.38)!important;background:rgba(5,17,27,.86)!important;color:#8fb2c4!important}
+.phase-indicator{backdrop-filter:blur(8px);border-radius:5px!important}
+@media(max-width:1120px){#mapSvg .bf2-region-name{font-size:10px}#mapSvg .bf2-territory-name{font-size:7px}}
+</style>
+<script id="bfPhase2Renderer">
+(function(){
+  'use strict';
+  const NS='http://www.w3.org/2000/svg';
+  let cacheKey='', cacheCells=[];
+  function rgba(hex,a){
+    if(!hex)return `rgba(112,145,160,${a})`;
+    let h=String(hex).trim();
+    if(h.startsWith('rgb')) return h.replace(/rgba?\(([^)]+)\)/,(m,x)=>{const p=x.split(',').slice(0,3).join(',');return `rgba(${p},${a})`});
+    h=h.replace('#',''); if(h.length===3)h=h.split('').map(c=>c+c).join('');
+    if(!/^[0-9a-f]{6}$/i.test(h))return `rgba(112,145,160,${a})`;
+    const n=parseInt(h,16);return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+  }
+  function clipHalf(poly,p,q){
+    if(!poly.length)return poly;
+    const mx=(p.x+q.x)/2,my=(p.y+q.y)/2,dx=q.x-p.x,dy=q.y-p.y;
+    const f=v=>(v.x-mx)*dx+(v.y-my)*dy;
+    const out=[];
+    for(let i=0;i<poly.length;i++){
+      const a=poly[i],b=poly[(i+1)%poly.length],fa=f(a),fb=f(b),ia=fa<=0.0001,ib=fb<=0.0001;
+      if(ia)out.push(a);
+      if(ia!==ib){const den=fa-fb;const t=Math.abs(den)<1e-9?.5:fa/den;out.push({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t});}
+    }
+    return out;
+  }
+  function cellsFor(territories){
+    const key=territories.map(t=>`${Math.round(t.x*10)},${Math.round(t.y*10)}`).join('|');
+    if(key===cacheKey&&cacheCells.length===territories.length)return cacheCells;
+    const cells=[];
+    for(let i=0;i<territories.length;i++){
+      let poly=[{x:7,y:7},{x:993,y:7},{x:993,y:693},{x:7,y:693}];
+      for(let j=0;j<territories.length&&poly.length;j++)if(i!==j)poly=clipHalf(poly,territories[i],territories[j]);
+      cells.push(poly);
+    }
+    cacheKey=key;cacheCells=cells;return cells;
+  }
+  function pts(poly){return poly.map(p=>`${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')}
+  function el(tag,attrs={}){const n=document.createElementNS(NS,tag);for(const [k,v] of Object.entries(attrs))n.setAttribute(k,String(v));return n}
+  function terrainPattern(defs,id,type){
+    const p=el('pattern',{id,patternUnits:'userSpaceOnUse',width:28,height:28});
+    const add=(tag,attrs)=>p.appendChild(el(tag,attrs));
+    if(type==='mountain'){
+      add('path',{d:'M2 23 L9 10 L16 23 M12 23 L19 7 L27 23',fill:'none',stroke:'rgba(223,235,240,.28)','stroke-width':1.3});
+    }else if(type==='forest'){
+      add('path',{d:'M7 22 L7 14 M3 16 L7 7 L11 16 Z M21 24 L21 16 M17 18 L21 9 L25 18 Z',fill:'rgba(180,219,193,.16)',stroke:'rgba(197,228,207,.24)','stroke-width':1});
+    }else if(type==='city'){
+      add('path',{d:'M2 7 H26 M2 16 H26 M8 2 V26 M18 2 V26',fill:'none',stroke:'rgba(224,229,218,.20)','stroke-width':1});
+      add('rect',{x:10,y:9,width:5,height:5,fill:'rgba(240,229,199,.13)'});
+    }else if(type==='desert'){
+      add('path',{d:'M0 10 C7 4 14 16 28 8 M0 22 C7 16 18 26 28 18',fill:'none',stroke:'rgba(239,210,145,.22)','stroke-width':1.1});
+      add('circle',{cx:7,cy:5,r:1.2,fill:'rgba(239,210,145,.22)'});add('circle',{cx:22,cy:15,r:1,fill:'rgba(239,210,145,.18)'});
+    }else if(type==='space'){
+      add('circle',{cx:5,cy:6,r:1.1,fill:'rgba(213,232,255,.35)'});add('circle',{cx:20,cy:11,r:.8,fill:'rgba(213,232,255,.26)'});add('circle',{cx:12,cy:23,r:.7,fill:'rgba(213,232,255,.24)'});
+    }else{
+      add('path',{d:'M0 8 H28 M0 20 H28',fill:'none',stroke:'rgba(210,230,209,.12)','stroke-width':1});
+      add('circle',{cx:8,cy:14,r:1,fill:'rgba(219,234,210,.18)'});add('circle',{cx:22,cy:4,r:.8,fill:'rgba(219,234,210,.14)'});
+    }
+    defs.appendChild(p);
+  }
+  function installDefs(svg){
+    const defs=el('defs');defs.id='bf2Defs';
+    ['plains','mountain','forest','city','desert','space'].forEach(t=>terrainPattern(defs,`bf2-terrain-${t}`,t));
+    const ocean=el('pattern',{id:'bf2Ocean',patternUnits:'userSpaceOnUse',width:72,height:54});
+    ocean.appendChild(el('path',{d:'M-8 15 C10 6 28 23 49 13 C61 7 72 9 82 15 M-12 42 C7 33 24 50 45 40 C59 33 74 35 84 42',fill:'none',stroke:'rgba(119,170,196,.085)','stroke-width':1.2}));
+    ocean.appendChild(el('circle',{cx:19,cy:27,r:1,fill:'rgba(163,202,218,.10)'}));defs.appendChild(ocean);
+    const marker=el('marker',{id:'bf2Arrow',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:7,markerHeight:7,orient:'auto-start-reverse'});
+    marker.appendChild(el('path',{d:'M 0 0 L 10 5 L 0 10 z',fill:'#ff5b67'}));defs.appendChild(marker);
+    const clip=el('clipPath',{id:'bf2LandClip'});
+    if(state&&state.map){for(let r=0;r<state.map.numRegions;r++){const m=state.map.territories.filter(t=>t.region===r);if(m.length)clip.appendChild(el('polygon',{points:expandedHullPoints(m)}));}}
+    defs.appendChild(clip);svg.insertBefore(defs,svg.firstChild);
+  }
+  function makeStronghold(x,y){
+    const g=el('g',{class:'bf2-stronghold',transform:`translate(${x+20} ${y-21})`});
+    g.appendChild(el('rect',{class:'fort-body',x:-7,y:-4,width:14,height:10,rx:1}));
+    [-6,-1,4].forEach(xx=>g.appendChild(el('rect',{class:'fort-body',x:xx,y:-8,width:3,height:5})));
+    g.appendChild(el('rect',{class:'fort-cut',x:-2,y:1,width:4,height:5,rx:1}));
+    return g;
+  }
+  function oceanLayer(svg){
+    const r=el('rect',{class:'bf2-ocean-layer',x:0,y:0,width:1000,height:700,fill:'url(#bf2Ocean)','pointer-events':'none'});
+    const first=[...svg.children].find(n=>n.tagName!=='defs')||null;svg.insertBefore(r,first);
+  }
+  function regionLayer(svg,firstRoute){
+    const g=el('g',{class:'bf2-land-layer','pointer-events':'none'});
+    for(let r=0;r<state.map.numRegions;r++){
+      const m=state.map.territories.filter(t=>t.region===r);if(!m.length)continue;
+      const p=expandedHullPoints(m);g.appendChild(el('polygon',{class:'bf2-landmass',points:p}));g.appendChild(el('polygon',{class:'bf2-landmass-inner',points:p}));
+    }
+    svg.insertBefore(g,firstRoute||null);
+  }
+  function territoryCells(svg,firstRoute){
+    const territories=state.map.territories,cells=cellsFor(territories),group=el('g',{class:'bf2-territory-layer','clip-path':'url(#bf2LandClip)'});
+    const player=state.players[state.currentPlayer];
+    let fortReach=null;if(state.phase==='fortify'&&selected!==null&&player&&player.isHuman)try{fortReach=getFortifyReachable(selected,player.id)}catch(_){ }
+    territories.forEach((t,i)=>{
+      const owner=t.owner!=null?state.players[t.owner]:null;
+      const terr=TERRAIN[t.terrain]||TERRAIN.plains;
+      const ownCol=owner?owner.color:'#87939a';
+      let targetable=false;
+      if((state.phase==='deployment'||state.phase==='capital')&&player&&player.isHuman&&t.owner===player.id)targetable=true;
+      if(selected!==null){
+        if(state.phase==='fortify')targetable=!!(fortReach&&fortReach.has(t.id));
+        else if(state.phase==='attack')targetable=state.map.adjacency[selected]?.includes(t.id)&&t.owner!==player?.id;
+      }
+      const cls=['bf2-cell'];if(selected===t.id)cls.push('selected');if(attackTarget===t.id)cls.push('attack-target');else if(targetable)cls.push('targetable');
+      const poly=el('polygon',{class:cls.join(' '),points:pts(cells[i]),fill:rgba(ownCol,owner?.eliminated?.08:.28),stroke:rgba(ownCol,owner?.eliminated?.24:.76),'stroke-width':1.8,'data-id':t.id,tabindex:'0'});
+      poly.addEventListener('click',()=>onTerritoryClick(t.id));poly.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();onTerritoryClick(t.id)}});
+      const title=el('title');title.textContent=`${t.name} — ${String(t.terrain).toUpperCase()} — ${t.armies} armies${t.stronghold?' — Stronghold':''}`;poly.appendChild(title);group.appendChild(poly);
+      const pat=el('polygon',{class:'bf2-terrain-pattern',points:pts(cells[i]),fill:`url(#bf2-terrain-${t.terrain in TERRAIN?t.terrain:'plains'})`,stroke:'none'});group.appendChild(pat);
+      // Subtle terrain undertone prevents ownership color from erasing geography.
+      const tint=el('polygon',{points:pts(cells[i]),fill:rgba(terr.color||'#82939a',.085),stroke:'none','pointer-events':'none'});group.appendChild(tint);
+    });
+    svg.insertBefore(group,firstRoute||null);
+  }
+  function gatewayMarkers(svg,firstNode){
+    const g=el('g',{class:'bf2-gateway-layer'}),T=state.map.territories;
+    state.map.links.forEach(([a,b])=>{
+      const A=T[a],B=T[b];
+      if(!A||!B||A.region===B.region)return;
+      const mx=(A.x+B.x)/2,my=(A.y+B.y)/2;
+      g.appendChild(el('circle',{class:'bf2-gateway',cx:mx,cy:my,r:5.2}));
+      g.appendChild(el('circle',{class:'bf2-gateway-core',cx:mx,cy:my,r:1.7}));
+    });
+    svg.insertBefore(g,firstNode||null);
+  }
+  function attackVectors(svg,firstNode){
+    if(!state||state.phase!=='attack'||selected==null)return;
+    const source=state.map.territories[selected],player=state.players[state.currentPlayer];if(!source||!player)return;
+    const targets=(state.map.adjacency[selected]||[]).map(id=>state.map.territories[id]).filter(t=>t&&t.owner!==player.id);
+    if(!targets.length)return;
+    const g=el('g',{class:'bf2-vector-layer'});
+    targets.forEach(t=>{
+      const dx=t.x-source.x,dy=t.y-source.y,d=Math.hypot(dx,dy)||1,ux=dx/d,uy=dy/d,px=-uy,py=ux;
+      const sx=source.x+ux*18,sy=source.y+uy*18,tx=t.x-ux*23,ty=t.y-uy*23,mx=(sx+tx)/2+px*12,my=(sy+ty)/2+py*12;
+      const focus=attackTarget===t.id;
+      g.appendChild(el('path',{class:`bf2-attack-vector${focus?'':' secondary'}`,d:`M ${sx.toFixed(1)} ${sy.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${tx.toFixed(1)} ${ty.toFixed(1)}`,'marker-end':focus?'url(#bf2Arrow)':''}));
+    });
+    svg.insertBefore(g,firstNode||null);
+  }
+  function labelsAndIcons(svg){
+    const g=el('g',{class:'bf2-label-layer','pointer-events':'none'}),T=state.map.territories,showNames=T.length<=56;
+    for(let r=0;r<state.map.numRegions;r++){
+      const m=T.filter(t=>t.region===r);if(!m.length)continue;const cx=m.reduce((s,t)=>s+t.x,0)/m.length,cy=m.reduce((s,t)=>s+t.y,0)/m.length;
+      const nm=el('text',{class:'bf2-region-name',x:cx,y:cy-50});nm.textContent=`REGION ${r+1}`;g.appendChild(nm);
+      const bn=el('text',{class:'bf2-region-bonus',x:cx,y:cy-37});bn.textContent=`CONTROL +${cfgRegionBonus(r)} / TURN`;g.appendChild(bn);
+    }
+    T.forEach(t=>{
+      if(showNames||t.stronghold||t.isCapital||selected===t.id){
+        const name=el('text',{class:`bf2-territory-name${t.stronghold||t.isCapital?' key':''}`,x:t.x,y:t.y+30});name.textContent=t.name;g.appendChild(name);
+        if(showNames&&T.length<=42){const tc=el('text',{class:'bf2-terrain-caption',x:t.x,y:t.y+40});tc.textContent=String(t.terrain).toUpperCase();g.appendChild(tc);}
+      }
+      if(t.stronghold)g.appendChild(makeStronghold(t.x,t.y));
+      if(t.isCapital&&state.techEnabled)g.appendChild(el('circle',{class:'bf2-capital-ring',cx:t.x,cy:t.y,r:21}));
+    });
+    svg.appendChild(g);
+  }
+  function tuneNodes(svg){
+    state.map.territories.forEach(t=>{
+      const g=svg.querySelector(`g.terr-node[data-id="${t.id}"]`);if(!g)return;
+      const bg=g.querySelector('.terr-bg'),ring=g.querySelector('.terr-ring');if(bg)bg.setAttribute('r','15');if(ring)ring.setAttribute('r','17');
+      // Tone down the old terrain halo now that terrain is encoded in the territory surface.
+      [...g.children].filter(n=>n.tagName==='circle'&&!n.classList.length&&n.getAttribute('r')==='24').forEach(n=>{n.setAttribute('opacity','.10');n.setAttribute('r','19')});
+      [...g.children].filter(n=>n.tagName==='circle'&&!n.classList.length&&n.getAttribute('r')==='9').forEach(n=>{n.setAttribute('opacity','.90');n.setAttribute('r','7.5')});
+      const os=g.querySelector('.owner-symbol');if(os){os.setAttribute('x',t.x+12);os.setAttribute('y',t.y+14)}
+      // Retain the original node's click handling as a compact army counter.
+    });
+  }
+  function phase2Map(){
+    if(typeof state==='undefined'||!state||!state.map)return;
+    const svg=document.getElementById('mapSvg');if(!svg)return;
+    svg.querySelectorAll('#bf2Defs,.bf2-ocean-layer,.bf2-land-layer,.bf2-territory-layer,.bf2-gateway-layer,.bf2-vector-layer,.bf2-label-layer').forEach(n=>n.remove());
+    installDefs(svg);oceanLayer(svg);
+    const firstRoute=svg.querySelector('.territory-link'),firstNode=svg.querySelector('.terr-node');
+    regionLayer(svg,firstRoute);territoryCells(svg,firstRoute);gatewayMarkers(svg,firstNode);attackVectors(svg,firstNode);tuneNodes(svg);labelsAndIcons(svg);
+  }
+  const base=window.renderMap;
+  if(typeof base==='function')window.renderMap=function(){base.apply(this,arguments);phase2Map();};
+  if(typeof state!=='undefined'&&state)try{phase2Map()}catch(e){console.warn('Phase 2 map enhancement skipped',e)}
+  window.BORDERFORGE_PHASE2={refresh:phase2Map,version:'2.0-final'};
+})();
+</script>
+
+
+<script>
+/* ================================================================
+   BORDERFORGE SAVE BACKEND v2 — IndexedDB-first persistent saves
+   ----------------------------------------------------------------
+   localStorage is unreliable for direct file:// testing in some
+   Chromium/Edge configurations and is also relatively quota-limited.
+   Game snapshots now live in IndexedDB. Small display/settings keys may
+   continue to use localStorage. Existing localStorage saves are migrated
+   opportunistically when available.
+   ================================================================ */
+(function(){
+  const BF_DB_NAME='borderforge_game_saves';
+  const BF_DB_VERSION=1;
+  const BF_STORE='saves';
+  const BF_SLOTS=['autosave','slot1','slot2','slot3'];
+  const bfSlotCache=Object.create(null);
+  let bfDbPromise=null;
+  let bfBackendLabel='IndexedDB';
+
+  function bfOpenDb(){
+    if(bfDbPromise)return bfDbPromise;
+    bfDbPromise=new Promise((resolve,reject)=>{
+      if(!('indexedDB' in window)){reject(new Error('IndexedDB is not available in this browser.'));return;}
+      let req;
+      try{req=indexedDB.open(BF_DB_NAME,BF_DB_VERSION);}catch(e){reject(e);return;}
+      req.onupgradeneeded=()=>{
+        const db=req.result;
+        if(!db.objectStoreNames.contains(BF_STORE))db.createObjectStore(BF_STORE,{keyPath:'slot'});
+      };
+      req.onsuccess=()=>resolve(req.result);
+      req.onerror=()=>reject(req.error||new Error('Could not open browser save database.'));
+      req.onblocked=()=>reject(new Error('Save database is blocked by another open BORDERFORGE tab.'));
+    });
+    return bfDbPromise;
+  }
+
+  async function bfDbGet(slot){
+    const db=await bfOpenDb();
+    return new Promise((resolve,reject)=>{
+      const tx=db.transaction(BF_STORE,'readonly');
+      const req=tx.objectStore(BF_STORE).get(slot);
+      req.onsuccess=()=>resolve(req.result?.raw||null);
+      req.onerror=()=>reject(req.error||new Error('Could not read save slot.'));
+    });
+  }
+  async function bfDbPut(slot,raw){
+    const db=await bfOpenDb();
+    return new Promise((resolve,reject)=>{
+      const tx=db.transaction(BF_STORE,'readwrite');
+      tx.objectStore(BF_STORE).put({slot,raw,updatedAt:Date.now()});
+      tx.oncomplete=()=>resolve(true);
+      tx.onerror=()=>reject(tx.error||new Error('Could not write save slot.'));
+      tx.onabort=()=>reject(tx.error||new Error('Save transaction was aborted.'));
+    });
+  }
+  async function bfDbDelete(slot){
+    const db=await bfOpenDb();
+    return new Promise((resolve,reject)=>{
+      const tx=db.transaction(BF_STORE,'readwrite');
+      tx.objectStore(BF_STORE).delete(slot);
+      tx.oncomplete=()=>resolve(true);
+      tx.onerror=()=>reject(tx.error||new Error('Could not delete save slot.'));
+    });
+  }
+
+  function bfLegacyRaw(slot){
+    try{
+      if(slot==='autosave')return localStorage.getItem(SAVE_KEY)||localStorage.getItem('borderforge_v1_autosave');
+      return localStorage.getItem(`borderforge_v1_${slot}`);
+    }catch(_){return null;}
+  }
+
+  async function bfRefreshCache(){
+    for(const slot of BF_SLOTS){
+      try{
+        let raw=await bfDbGet(slot);
+        if(!raw){
+          const legacy=bfLegacyRaw(slot);
+          if(legacy){
+            try{await bfDbPut(slot,legacy);raw=legacy;}catch(_){}
+          }
+        }
+        if(raw)bfSlotCache[slot]=raw;else delete bfSlotCache[slot];
+      }catch(e){
+        // IndexedDB unavailable: preserve a best-effort localStorage fallback.
+        bfBackendLabel='localStorage fallback';
+        const raw=bfLegacyRaw(slot);
+        if(raw)bfSlotCache[slot]=raw;else delete bfSlotCache[slot];
+      }
+    }
+    // Old game snapshots no longer need to occupy localStorage once migrated.
+    if(bfBackendLabel==='IndexedDB'){
+      try{
+        localStorage.removeItem(SAVE_KEY);
+        localStorage.removeItem('borderforge_v1_autosave');
+        localStorage.removeItem('borderforge_v1_slot1');
+        localStorage.removeItem('borderforge_v1_slot2');
+        localStorage.removeItem('borderforge_v1_slot3');
+      }catch(_){}
+    }
+  }
+
+  function bfMetaFromRaw(raw){
+    try{
+      const x=JSON.parse(raw||'null');
+      if(!x||x.schemaVersion!==SAVE_SCHEMA)return null;
+      return {
+        turn:x.turn,
+        length:x.gameLength,
+        gameLength:x.gameLength,
+        ruleset:x.ruleset||x.config?.ruleset||'terrain',
+        scenario:x.scenario||'standard',
+        seed:x.mapSeed||x.map?.seed||'—',
+        mapSeed:x.mapSeed||x.map?.seed||'—',
+        numTerritories:x.map?.territories?.length||0,
+        savedAt:x.savedAt||null
+      };
+    }catch(_){return null;}
+  }
+
+  async function bfStoreRaw(slot,raw){
+    try{
+      await bfDbPut(slot,raw);
+      bfBackendLabel='IndexedDB';
+      bfSlotCache[slot]=raw;
+      return {ok:true,backend:'IndexedDB'};
+    }catch(idbError){
+      // Compatibility fallback for hosted browsers where localStorage works.
+      try{
+        const key=slot==='autosave'?SAVE_KEY:`borderforge_v1_${slot}`;
+        const result=storeSaveRaw(key,raw);
+        if(result.ok){
+          bfBackendLabel='localStorage fallback';
+          bfSlotCache[slot]=raw;
+          return {ok:true,backend:'localStorage'};
+        }
+      }catch(_){}
+      return {ok:false,error:idbError};
+    }
+  }
+
+  function bfSaveError(e){
+    const detail=e?.message?` (${e.message})`:'';
+    return `BORDERFORGE could not write persistent browser storage${detail}. Your current game is still running. Use Export Save File for an immediate portable backup.`;
+  }
+
+  function bfApplySaveRaw(raw){
+    try{
+      const loaded=JSON.parse(raw);
+      if(!loaded||loaded.schemaVersion!==SAVE_SCHEMA)throw new Error('Saved game is from an incompatible version.');
+      delete loaded.savedAt;
+      state=loaded;
+      if(!state.ruleset)state.ruleset=state.config?.ruleset||'terrain';
+      if(!state.escalation)state.escalation=state.config?.escalation||'balanced';
+      if(!state.mapSeed)state.mapSeed=state.map?.seed||'legacy';
+      if(!state.turnOrder)state.turnOrder=state.players.map(p=>p.id);
+      if(!state.deploymentStyle)state.deploymentStyle=state.config?.deploymentStyle||'quick';
+      if(!state.playerAssistance)state.playerAssistance=state.config?.playerAssistance||'none';
+      if(state.spectatorMode===undefined)state.spectatorMode=false;
+      if(state.humanEliminationPending===undefined)state.humanEliminationPending=false;
+      if(state.pausedAtTurnBoundary===undefined)state.pausedAtTurnBoundary=false;
+      if(!state.map.regionBonuses){
+        state.map.regionBonuses={};
+        for(let r=0;r<state.map.numRegions;r++){
+          const size=state.map.territories.filter(t=>t.region===r).length;
+          const gateways=state.map.regionGatewayCounts?.[r]||2;
+          state.map.regionBonuses[r]=Math.max(2,2+Math.floor(size/5)+Math.max(0,gateways-2));
+        }
+      }
+      resetMapView();
+      selected=null;attackTarget=null;pendingFortify=null;placementHistory=[];
+      if(!state.truces)state.truces={};
+      if(!state.truceOffers)state.truceOffers=[];
+      for(const p of state.players){
+        if(!p.grudges)p.grudges={};
+        if(!p.cards)p.cards=[];
+        if(p.campaignAxis===undefined)p.campaignAxis=null;
+      }
+      for(const t of state.map.territories){if(!t.specialists)t.specialists={shock:0,guerilla:0,siege:0};}
+      if(state.config){
+        if(state.config.strongholdVictoryEnabled===undefined)state.config.strongholdVictoryEnabled=(state.gameLength!=='campaign');
+        if(state.config.breakthroughIsWin===undefined)state.config.breakthroughIsWin=false;
+        if(state.config.strongholdArmyBonus===undefined)state.config.strongholdArmyBonus=(state.gameLength==='campaign')?2:0;
+        if(state.config.finalHourTurn===undefined)state.config.finalHourTurn=(state.gameLength==='campaign')?80:22;
+        if(state.config.researchRequired===undefined)state.config.researchRequired=(state.gameLength==='campaign')?54:15;
+        if(state.config.strongholdHoldTurns===undefined)state.config.strongholdHoldTurns=(state.gameLength==='campaign')?4:2;
+      }
+      document.getElementById('setupModal')?.classList.remove('show');
+      render();updateVictoryConditionsPanel();
+      log('SYSTEM',`Game loaded (turn ${state.turn}).`,'system');
+      const current=state.players[state.currentPlayer];
+      if(current&&!current.isHuman&&!state.gameOver){if(!state.aiSpeed)state.aiSpeed='normal';setTimeout(()=>runAITurn(state.currentPlayer),aiDelay('turnStart'));}
+      refreshSpeedControls();
+      return true;
+    }catch(e){alert('Could not load saved game: '+e.message);return false;}
+  }
+
+  // Replace synchronous localStorage slot access with the in-memory mirror of
+  // the IndexedDB store. The mirror is refreshed whenever the manager opens.
+  v4RawForSlot=function(slot){return bfSlotCache[slot]||null;};
+  readSlotMeta=function(slot){return bfMetaFromRaw(bfSlotCache[slot]);};
+  hasSave=function(){return !!bfMetaFromRaw(bfSlotCache.autosave);};
+  peekSave=function(){return bfMetaFromRaw(bfSlotCache.autosave);};
+
+  saveToSlot=async function(slot,silent=false){
+    if(!state)return false;
+    try{
+      const raw=JSON.stringify(buildGameplaySavePayload());
+      const result=await bfStoreRaw(slot,raw);
+      if(!result.ok){if(!silent)alert(bfSaveError(result.error));return false;}
+      if(!silent)log('SYSTEM',`${slot==='autosave'?'Autosave':slot.toUpperCase()} saved (turn ${state.turn}) using ${result.backend}.`,'system');
+      return true;
+    }catch(e){if(!silent)alert(bfSaveError(e));return false;}
+  };
+
+  saveGame=async function(){
+    if(!state||state.gameOver===undefined){log('SYSTEM','Nothing to save — no active game.','system');return false;}
+    const current=state.players[state.currentPlayer];
+    if(current&&!current.isHuman&&!state.gameOver){log('SYSTEM','Wait for your turn to save.','system');return false;}
+    return await saveToSlot('autosave',false);
+  };
+
+  loadFromSlot=async function(slot){
+    try{
+      let raw=null;
+      try{raw=await bfDbGet(slot);}catch(_){raw=bfSlotCache[slot]||bfLegacyRaw(slot);}
+      if(!raw){alert('That save slot is empty.');return false;}
+      bfSlotCache[slot]=raw;
+      closeModalById('saveManagerModal');
+      const ok=bfApplySaveRaw(raw);
+      if(ok)applyDisplaySettings(state.displaySettings||{},true);
+      return ok;
+    }catch(e){alert('Could not load slot: '+e.message);return false;}
+  };
+
+  loadGame=async function(){return await loadFromSlot('autosave');};
+
+  deleteSlot=async function(slot){
+    try{await bfDbDelete(slot);}catch(_){try{localStorage.removeItem(slot==='autosave'?SAVE_KEY:`borderforge_v1_${slot}`);}catch(__){}}
+    delete bfSlotCache[slot];
+    renderSaveManager();
+    if(slot==='autosave')refreshResumeSection();
+  };
+  deleteSave=async function(){await deleteSlot('autosave');};
+
+  window.bfSaveSlotUI=async function(slot){
+    const ok=await saveToSlot(slot,false);
+    if(ok){await bfRefreshCache();renderSaveManager();refreshResumeSection();}
+  };
+  window.bfDeleteSlotUI=async function(slot){await deleteSlot(slot);await bfRefreshCache();renderSaveManager();};
+
+  renderSaveManager=function(){
+    const el=document.getElementById('saveSlotsList');if(!el)return;
+    const rows=BF_SLOTS.map(slot=>{
+      const m=bfMetaFromRaw(bfSlotCache[slot]);
+      const label=slot==='autosave'?'AUTOSAVE':slot.toUpperCase();
+      const detail=m?`Turn ${m.turn} · ${scenarioLabel(m.scenario)} · Seed ${escapeHtml(m.seed||'—')} · ${m.savedAt?new Date(m.savedAt).toLocaleString():'saved'}`:'Empty';
+      return `<div style="display:flex;gap:8px;align-items:center;border-bottom:1px dotted rgba(138,155,130,.2);padding:8px 0;"><div style="flex:1"><b style="color:var(--accent)">${label}</b><div style="font-size:10px;color:var(--ink-dim)">${detail}</div></div><button class="btn" onclick="bfSaveSlotUI('${slot}')">Save</button><button class="btn" ${m?'':'disabled'} onclick="loadFromSlot('${slot}')">Load</button><button class="btn" ${m?'':'disabled'} onclick="bfDeleteSlotUI('${slot}')">×</button></div>`;
+    }).join('');
+    el.innerHTML=`<div style="font-size:10px;color:var(--ink-dim);margin:2px 0 8px;line-height:1.5;"><b style="color:var(--green)">Persistent save backend: ${escapeHtml(bfBackendLabel)}</b><br>Game slots are stored separately from optional balance telemetry. Export Save File remains the recommended portable backup.</div>${rows}`;
+  };
+
+  openSaveManager=async function(){
+    await bfRefreshCache();
+    renderSaveManager();
+    document.getElementById('saveManagerModal')?.classList.add('show');
+  };
+
+  refreshResumeSection=async function(){
+    const section=document.getElementById('resumeSection');if(!section)return;
+    await bfRefreshCache();
+    const meta=bfMetaFromRaw(bfSlotCache.autosave);
+    if(!meta){section.style.display='none';return;}
+    section.style.display='block';
+    const info=document.getElementById('resumeInfo');
+    if(info){
+      const lengthLabels={quick:'Quick',standard:'Standard',grand:'Grand',campaign:'Campaign'};
+      const lengthLabel=lengthLabels[meta.gameLength]||meta.gameLength;
+      const rulesetLabel=meta.ruleset==='classic'?'Core Conquest':'Frontier Command';
+      const when=meta.savedAt?new Date(meta.savedAt).toLocaleString():'unknown';
+      info.innerHTML=`<b style="color:var(--accent)">${rulesetLabel} · ${lengthLabel}</b> · Turn ${meta.turn} · ${meta.numTerritories} territories · Seed ${escapeHtml(meta.mapSeed)}<br><span style="color:var(--ink-dim);font-size:10px;">Saved ${when} · ${escapeHtml(bfBackendLabel)}</span>`;
+    }
+  };
+
+  importSaveFile=function(file){
+    if(!file)return;
+    const r=new FileReader();
+    r.onload=async()=>{
+      try{
+        const obj=JSON.parse(r.result);
+        if(!obj||obj.schemaVersion!==SAVE_SCHEMA||!obj.map||!obj.players)throw new Error('Not a compatible v5 save file.');
+        const raw=JSON.stringify(obj);
+        const result=await bfStoreRaw('autosave',raw);
+        if(!result.ok)throw result.error;
+        bfApplySaveRaw(raw);applyDisplaySettings(state.displaySettings||{},true);closeModalById('saveManagerModal');refreshResumeSection();
+      }catch(e){alert('Import failed: '+bfSaveError(e));}
+    };
+    r.readAsText(file);
+  };
+
+  // Header SAVE is a one-click quick save. Shift-click (or Ctrl/Cmd+Shift+S)
+  // opens the multi-slot manager without making ordinary players manage slots.
+  async function bfQuickSaveFeedback(){
+    const ok=await saveGame();
+    if(ok){
+      const btn=document.getElementById('hdrSaveBtn');
+      if(btn){
+        btn.classList.add('just-saved');
+        const originalText=btn.dataset.baseText||btn.textContent||'◆ SAVE';
+        btn.dataset.baseText=originalText;
+        btn.textContent='◆ SAVED';
+        setTimeout(()=>{btn.classList.remove('just-saved');btn.textContent=btn.dataset.baseText||'◆ SAVE';},1500);
+      }
+      refreshResumeSection();
+    }
+    return ok;
+  }
+  const saveBtn=document.getElementById('hdrSaveBtn');
+  if(saveBtn){
+    saveBtn.title='Quick save current campaign · Shift-click for save slots';
+    saveBtn.onclick=async(ev)=>{
+      if(ev?.shiftKey){await openSaveManager();return;}
+      await bfQuickSaveFeedback();
+    };
+  }
+  document.addEventListener('keydown',async ev=>{
+    const tag=(ev.target?.tagName||'').toLowerCase();
+    if(['input','textarea','select'].includes(tag))return;
+    if((ev.ctrlKey||ev.metaKey)&&ev.key.toLowerCase()==='s'){
+      ev.preventDefault();
+      if(ev.shiftKey)await openSaveManager();
+      else await bfQuickSaveFeedback();
+    }
+  },true);
+
+  // Rebind explicit setup controls because their original handlers were
+  // attached before this IndexedDB layer existed.
+  const rb=document.getElementById('resumeBtn');if(rb)rb.onclick=()=>loadGame();
+  const db=document.getElementById('discardSaveBtn');if(db)db.onclick=async()=>{if(confirm('Discard saved game? This cannot be undone.')){await deleteSave();refreshResumeSection();}};
+
+  window.BORDERFORGE_SAVE_BACKEND={
+    name:'IndexedDB-first v2',
+    refresh:bfRefreshCache,
+    get:bfDbGet,
+    put:bfDbPut,
+    remove:bfDbDelete
+  };
+
+  // Initialize asynchronously. This also migrates any readable legacy slots.
+  bfRefreshCache().then(()=>{renderSaveManager();refreshResumeSection();}).catch(()=>{});
+})();
+</script>
+
+<script id="bfPhase2CloseoutMeta">
+window.BORDERFORGE_BUILD=Object.freeze({
+  label:'Phase 2 Final',
+  phase:2,
+  saveBackend:'IndexedDB-first v2',
+  saveSchema:5,
+  built:'2026-09-08'
+});
+</script>
+
 </body>
 </html>
