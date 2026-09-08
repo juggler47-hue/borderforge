@@ -11775,6 +11775,815 @@ v5InstallUI();document.getElementById('startBtn').onclick=v5StartGame;v5PreviewG
     return _v5BaseTelemRecord(rec);
   };
 })();
+
+// ============================================================
+// BORDERFORGE ONLINE MULTIPLAYER MVP (PeerJS / WebRTC)
+// Added 2026-09 — static-host friendly multiplayer for GitHub Pages.
+//
+// Architecture:
+//   • Star network: every client connects to the room host.
+//   • Turn-owner authority: the human whose turn it is mutates the state.
+//     That browser continues to run any immediately-following AI turns until
+//     control reaches the next human commander.
+//   • Full state snapshots are relayed after state-changing renders.
+//   • Only the locally assigned human seat can use game actions.
+//
+// This is intended for friendly/private games. Every participant receives a
+// full state snapshot, so a determined player can inspect hidden information
+// in developer tools. A server-authoritative backend is required for ranked
+// or cheat-resistant play.
+// ============================================================
+(() => {
+  'use strict';
+
+  const MP_PEERJS_URL = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
+  const MP_PEER_PREFIX = 'borderforge-';
+  const MP_PROTOCOL = 1;
+
+  let mpMode = 'local';              // local | host | client
+  let mpPeer = null;
+  let mpHostConn = null;             // client -> host DataConnection
+  const mpHostConnections = new Map(); // host: peerId -> {conn, seat, token}
+  const mpTokenSeats = new Map();    // host: reconnect token -> seat
+  let mpExpectedHumans = 1;
+  let mpRoomCode = '';
+  let mpLocalSeat = null;
+  let mpAuthoritySeat = null;
+  let mpGameStarted = false;
+  let mpApplyingRemote = false;
+  let mpLastStateJson = '';
+  let mpRevision = 0;
+  let mpLastAppliedRevision = 0;
+  let mpPeerLoading = null;
+  let mpReconnectToken = '';
+  let mpLastStatus = 'Local play';
+  let mpStateBroadcastTimer = null;
+
+  function mpOnline() { return mpMode === 'host' || mpMode === 'client'; }
+  function mpHost() { return mpMode === 'host'; }
+  function mpClient() { return mpMode === 'client'; }
+
+  function mpRandomCode() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = new Uint32Array(6);
+    if (window.crypto?.getRandomValues) window.crypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 0xffffffff);
+    return Array.from(bytes, n => alphabet[n % alphabet.length]).join('');
+  }
+
+  function mpRandomToken() {
+    const a = new Uint32Array(4);
+    if (window.crypto?.getRandomValues) window.crypto.getRandomValues(a);
+    else for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 0xffffffff);
+    return Array.from(a, n => n.toString(36)).join('-');
+  }
+
+  function mpNormalizeRoomCode(value) {
+    return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+  }
+
+  function mpSetStatus(text, kind) {
+    mpLastStatus = text || '';
+    const el = document.getElementById('mpStatus');
+    if (el) {
+      el.textContent = mpLastStatus;
+      el.dataset.kind = kind || 'normal';
+    }
+    const chip = document.getElementById('mpHeaderChip');
+    if (chip) {
+      chip.textContent = mpOnline() ? `◉ ${mpLastStatus}` : 'LOCAL PLAY';
+      chip.style.color = kind === 'error' ? 'var(--red)' : (kind === 'good' ? 'var(--green)' : 'var(--accent)');
+      chip.style.display = mpOnline() ? '' : 'none';
+    }
+  }
+
+  function mpLoadPeerJS() {
+    if (window.Peer) return Promise.resolve(window.Peer);
+    if (mpPeerLoading) return mpPeerLoading;
+    mpPeerLoading = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = MP_PEERJS_URL;
+      s.async = true;
+      s.onload = () => window.Peer ? resolve(window.Peer) : reject(new Error('PeerJS loaded but Peer was unavailable.'));
+      s.onerror = () => reject(new Error('Could not load PeerJS. Check your network/content blocker.'));
+      document.head.appendChild(s);
+    });
+    return mpPeerLoading;
+  }
+
+  function mpDestroyNetwork() {
+    try { mpHostConn?.close(); } catch (_) {}
+    mpHostConn = null;
+    for (const item of mpHostConnections.values()) {
+      try { item.conn?.close(); } catch (_) {}
+    }
+    mpHostConnections.clear();
+    mpTokenSeats.clear();
+    try { mpPeer?.destroy(); } catch (_) {}
+    mpPeer = null;
+    mpRoomCode = '';
+    mpLocalSeat = null;
+    mpAuthoritySeat = null;
+    mpExpectedHumans = 1;
+    mpGameStarted = false;
+    mpRevision = 0;
+    mpLastAppliedRevision = 0;
+    mpLastStateJson = '';
+    mpApplyingRemote = false;
+    if (mpStateBroadcastTimer) clearTimeout(mpStateBroadcastTimer);
+    mpStateBroadcastTimer = null;
+  }
+
+  function mpSeatLabel(seat) {
+    if (state?.players?.[seat]) return state.players[seat].name;
+    if (seat === 0) return 'HOST COMMANDER';
+    return seat == null ? '—' : `COMMANDER ${seat + 1}`;
+  }
+
+  function mpConnectedSeats() {
+    const seats = new Set([0]);
+    for (const item of mpHostConnections.values()) {
+      if (item.conn?.open && Number.isInteger(item.seat)) seats.add(item.seat);
+    }
+    return [...seats].sort((a,b) => a-b);
+  }
+
+  function mpHostLobbyPayload() {
+    return {
+      type: 'lobby', protocol: MP_PROTOCOL,
+      roomCode: mpRoomCode,
+      expectedHumans: mpExpectedHumans,
+      connectedSeats: mpConnectedSeats(),
+      started: mpGameStarted
+    };
+  }
+
+  function mpSendSafe(conn, payload) {
+    if (!conn || !conn.open) return false;
+    try { conn.send(payload); return true; }
+    catch (e) { console.warn('[Borderforge MP] send failed', e); return false; }
+  }
+
+  function mpBroadcast(payload, exceptPeerId) {
+    for (const [peerId, item] of mpHostConnections.entries()) {
+      if (peerId === exceptPeerId) continue;
+      mpSendSafe(item.conn, payload);
+    }
+  }
+
+  function mpBroadcastLobby() {
+    if (!mpHost()) return;
+    const payload = mpHostLobbyPayload();
+    mpBroadcast(payload);
+    mpUpdateLobbyUI();
+  }
+
+  function mpFindOpenSeat() {
+    const used = new Set([0]);
+    for (const item of mpHostConnections.values()) {
+      if (Number.isInteger(item.seat) && item.conn?.open) used.add(item.seat);
+    }
+    for (let seat = 1; seat < mpExpectedHumans; seat++) if (!used.has(seat)) return seat;
+    return null;
+  }
+
+  function mpConnectedHumanCount() {
+    return mpHost() ? mpConnectedSeats().filter(s => s < mpExpectedHumans).length : 0;
+  }
+
+  function mpUpdateLobbyUI() {
+    const roomOut = document.getElementById('mpRoomOutput');
+    const joinBtn = document.getElementById('mpJoinBtn');
+    const startBtn = document.getElementById('startBtn');
+    const humans = document.getElementById('setupHumans');
+
+    if (roomOut) roomOut.textContent = mpRoomCode || '—';
+
+    if (!startBtn) return;
+    if (mpMode === 'local') {
+      startBtn.disabled = false;
+      startBtn.textContent = 'Begin Deployment';
+      if (humans) humans.disabled = false;
+      return;
+    }
+    if (mpHost()) {
+      const connected = mpConnectedHumanCount();
+      const ready = !!mpPeer && !!mpRoomCode && connected >= mpExpectedHumans;
+      startBtn.disabled = !ready || mpGameStarted;
+      startBtn.textContent = mpGameStarted ? 'Game In Progress' : (ready ? 'Begin Online Deployment' : `Waiting for Commanders (${connected}/${mpExpectedHumans})`);
+      if (humans) humans.disabled = !!mpRoomCode;
+      return;
+    }
+    if (mpClient()) {
+      startBtn.disabled = true;
+      startBtn.textContent = mpGameStarted ? 'Game In Progress' : 'Waiting for Host to Start';
+      if (humans) humans.disabled = true;
+      if (joinBtn) joinBtn.disabled = !!mpHostConn?.open;
+    }
+  }
+
+  async function mpCreateRoom() {
+    if (state && !state.gameOver) {
+      alert('Finish or reload the current game before creating an online room.');
+      return;
+    }
+    const humansEl = document.getElementById('setupHumans');
+    const requested = parseInt(humansEl?.value || '1');
+    if (!Number.isFinite(requested) || requested < 2) {
+      alert('Online play needs at least 2 Human Commanders. Choose 2–4 humans first.');
+      return;
+    }
+    if (requested > 4) {
+      alert('Online multiplayer currently supports up to 4 human commanders.');
+      return;
+    }
+
+    mpDestroyNetwork();
+    mpMode = 'host';
+    mpExpectedHumans = requested;
+    mpLocalSeat = 0;
+    mpAuthoritySeat = 0;
+    mpRoomCode = mpRandomCode();
+    mpSetStatus('Creating room…');
+    mpUpdateModeUI();
+
+    try {
+      const PeerCtor = await mpLoadPeerJS();
+      const peerId = MP_PEER_PREFIX + mpRoomCode.toLowerCase();
+      mpPeer = new PeerCtor(peerId, { debug: 1 });
+      mpPeer.on('open', () => {
+        mpSetStatus(`Room ${mpRoomCode} · 1/${mpExpectedHumans} connected`, 'good');
+        mpUpdateLobbyUI();
+      });
+      mpPeer.on('connection', conn => mpAcceptHostConnection(conn));
+      mpPeer.on('error', err => {
+        console.warn('[Borderforge MP] host peer error', err);
+        if (err?.type === 'unavailable-id') {
+          mpSetStatus('Room-code collision. Create the room again.', 'error');
+        } else mpSetStatus(`Network error: ${err?.type || err?.message || 'unknown'}`, 'error');
+        mpUpdateLobbyUI();
+      });
+      mpPeer.on('disconnected', () => mpSetStatus('Signaling disconnected; existing peers may continue.', 'error'));
+    } catch (e) {
+      mpSetStatus(e.message, 'error');
+      alert(e.message);
+    }
+  }
+
+  function mpAcceptHostConnection(conn) {
+    conn.on('open', () => {
+      mpHostConnections.set(conn.peer, { conn, seat: null, token: null });
+      mpSetStatus(`Commander connecting to room ${mpRoomCode}…`);
+      mpBroadcastLobby();
+    });
+    conn.on('data', data => mpHandleHostData(conn, data));
+    conn.on('close', () => {
+      const item = mpHostConnections.get(conn.peer);
+      const seat = item?.seat;
+      mpHostConnections.delete(conn.peer);
+      mpSetStatus(`Room ${mpRoomCode} · ${mpConnectedHumanCount()}/${mpExpectedHumans} connected${seat === mpAuthoritySeat ? ' · active commander disconnected' : ''}`, seat === mpAuthoritySeat ? 'error' : 'normal');
+      mpBroadcastLobby();
+      mpUpdateMultiplayerStatus();
+    });
+    conn.on('error', err => console.warn('[Borderforge MP] connection error', err));
+  }
+
+  function mpHandleHostData(conn, data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.protocol && data.protocol !== MP_PROTOCOL) return;
+
+    if (data.type === 'join') {
+      const current = mpHostConnections.get(conn.peer) || { conn, seat: null, token: null };
+      let seat = null;
+      const token = String(data.token || '');
+      if (token && mpTokenSeats.has(token)) {
+        const wanted = mpTokenSeats.get(token);
+        const occupied = [...mpHostConnections.values()].some(x => x !== current && x.conn?.open && x.seat === wanted);
+        if (!occupied && wanted > 0 && wanted < mpExpectedHumans) seat = wanted;
+      }
+      if (seat === null) seat = mpFindOpenSeat();
+      if (seat === null) {
+        mpSendSafe(conn, { type:'reject', protocol:MP_PROTOCOL, reason:'This Borderforge room is full.' });
+        setTimeout(() => { try { conn.close(); } catch (_) {} }, 200);
+        return;
+      }
+      current.seat = seat;
+      current.token = token || mpRandomToken();
+      mpHostConnections.set(conn.peer, current);
+      mpTokenSeats.set(current.token, seat);
+      mpSendSafe(conn, {
+        type:'seat', protocol:MP_PROTOCOL, seat,
+        token: current.token, roomCode: mpRoomCode,
+        expectedHumans: mpExpectedHumans,
+        started: mpGameStarted
+      });
+      mpBroadcastLobby();
+      if (mpGameStarted && state) mpSendCurrentStateTo(conn, mpAuthoritySeat);
+      return;
+    }
+
+    if (data.type === 'state' && mpGameStarted) {
+      const item = mpHostConnections.get(conn.peer);
+      if (!item || item.seat !== mpAuthoritySeat) {
+        console.warn('[Borderforge MP] ignored state from non-authority seat', item?.seat, 'expected', mpAuthoritySeat);
+        return;
+      }
+      if (!data.state || typeof data.state !== 'object') return;
+      mpApplyRemoteState(data.state, null, true);
+      const nextAuthority = mpAuthorityForSnapshot(item.seat, data.state);
+      mpAuthoritySeat = nextAuthority;
+      mpRevision++;
+      const relay = { type:'state', protocol:MP_PROTOCOL, revision:mpRevision, authoritySeat:mpAuthoritySeat, state:data.state };
+      mpBroadcast(relay, conn.peer);
+      mpLastAppliedRevision = mpRevision;
+      mpLastStateJson = mpSerializeState(data.state);
+      if (mpAuthoritySeat === mpLocalSeat && state?.players?.[state.currentPlayer]?.isHuman) {
+        processPendingTruceOffers();
+        mpQueueStateBroadcast();
+      }
+      mpUpdateMultiplayerStatus();
+      return;
+    }
+
+    if (data.type === 'request_state' && mpGameStarted && state) {
+      mpSendCurrentStateTo(conn, mpAuthoritySeat);
+    }
+  }
+
+  async function mpJoinRoom() {
+    if (state && !state.gameOver) {
+      alert('Finish or reload the current game before joining an online room.');
+      return;
+    }
+    const input = document.getElementById('mpJoinCode');
+    const code = mpNormalizeRoomCode(input?.value);
+    if (code.length < 4) {
+      alert('Enter the room code from the host.');
+      return;
+    }
+
+    mpDestroyNetwork();
+    mpMode = 'client';
+    mpRoomCode = code;
+    mpLocalSeat = null;
+    mpAuthoritySeat = null;
+    const tokenKey = `borderforge_mp_token_${code}`;
+    try { mpReconnectToken = localStorage.getItem(tokenKey) || mpRandomToken(); }
+    catch (_) { mpReconnectToken = mpRandomToken(); }
+    mpSetStatus(`Joining ${code}…`);
+    mpUpdateModeUI();
+
+    try {
+      const PeerCtor = await mpLoadPeerJS();
+      mpPeer = new PeerCtor(undefined, { debug: 1 });
+      mpPeer.on('open', () => {
+        mpHostConn = mpPeer.connect(MP_PEER_PREFIX + code.toLowerCase(), {
+          serialization: 'json',
+          metadata: { game:'borderforge', protocol:MP_PROTOCOL }
+        });
+        mpHostConn.on('open', () => {
+          mpSetStatus(`Connected to ${code}; requesting seat…`);
+          mpSendSafe(mpHostConn, { type:'join', protocol:MP_PROTOCOL, token:mpReconnectToken });
+          mpUpdateLobbyUI();
+        });
+        mpHostConn.on('data', data => mpHandleClientData(data));
+        mpHostConn.on('close', () => {
+          mpSetStatus('Host connection closed. Rejoin the room to continue.', 'error');
+          mpUpdateLobbyUI();
+        });
+        mpHostConn.on('error', err => mpSetStatus(`Connection error: ${err?.message || err}`, 'error'));
+      });
+      mpPeer.on('error', err => {
+        console.warn('[Borderforge MP] client peer error', err);
+        mpSetStatus(`Network error: ${err?.type || err?.message || 'unknown'}`, 'error');
+      });
+    } catch (e) {
+      mpSetStatus(e.message, 'error');
+      alert(e.message);
+    }
+  }
+
+  function mpHandleClientData(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.protocol && data.protocol !== MP_PROTOCOL) return;
+    if (data.type === 'reject') {
+      mpSetStatus(data.reason || 'Room rejected the connection.', 'error');
+      alert(data.reason || 'Could not join this room.');
+      return;
+    }
+    if (data.type === 'seat') {
+      mpLocalSeat = data.seat;
+      mpExpectedHumans = data.expectedHumans || mpExpectedHumans;
+      mpGameStarted = !!data.started;
+      mpReconnectToken = data.token || mpReconnectToken;
+      try { localStorage.setItem(`borderforge_mp_token_${mpRoomCode}`, mpReconnectToken); } catch (_) {}
+      mpSetStatus(`Room ${mpRoomCode} · you are ${mpSeatLabel(mpLocalSeat)}`, 'good');
+      mpUpdateLobbyUI();
+      if (mpGameStarted) mpSendSafe(mpHostConn, {type:'request_state', protocol:MP_PROTOCOL});
+      return;
+    }
+    if (data.type === 'lobby') {
+      mpExpectedHumans = data.expectedHumans || mpExpectedHumans;
+      mpGameStarted = !!data.started;
+      const count = Array.isArray(data.connectedSeats) ? data.connectedSeats.length : '?';
+      mpSetStatus(`Room ${mpRoomCode} · ${count}/${mpExpectedHumans} connected${mpLocalSeat == null ? '' : ` · seat ${mpLocalSeat + 1}`}`, 'good');
+      mpUpdateLobbyUI();
+      return;
+    }
+    if (data.type === 'state') {
+      if ((data.revision || 0) <= mpLastAppliedRevision) return;
+      mpLastAppliedRevision = data.revision || (mpLastAppliedRevision + 1);
+      mpAuthoritySeat = data.authoritySeat;
+      mpGameStarted = true;
+      mpApplyRemoteState(data.state, data.revision, false);
+      if (mpCanLocalAct()) {
+        // The arriving online commander replaces the hot-seat confirmation
+        // step, including delivery of any queued diplomacy offers.
+        processPendingTruceOffers();
+        mpQueueStateBroadcast();
+      }
+      mpUpdateMultiplayerStatus();
+    }
+  }
+
+  function mpSerializeState(value) {
+    try { return JSON.stringify(value); }
+    catch (e) { console.warn('[Borderforge MP] state serialization failed', e); return ''; }
+  }
+
+  function mpAuthorityForSnapshot(previousAuthority, snapshot) {
+    try {
+      const cp = snapshot.players?.[snapshot.currentPlayer];
+      if (cp?.isHuman) return snapshot.currentPlayer;
+    } catch (_) {}
+    return previousAuthority;
+  }
+
+  function mpSendCurrentStateTo(conn, authoritySeat) {
+    if (!state) return;
+    const json = mpSerializeState(state);
+    if (!json) return;
+    mpRevision++;
+    mpSendSafe(conn, {
+      type:'state', protocol:MP_PROTOCOL, revision:mpRevision,
+      authoritySeat: authoritySeat ?? mpAuthoritySeat,
+      state: JSON.parse(json)
+    });
+  }
+
+  function mpApplyRemoteState(snapshot, revision, fromClientToHost) {
+    if (!snapshot || typeof snapshot !== 'object') return;
+    mpApplyingRemote = true;
+    try {
+      state = snapshot;
+      selected = null;
+      attackTarget = null;
+      pendingAdvance = null;
+      pendingFortify = null;
+      placementHistory = [];
+      blitzInProgress = false;
+      handoffPending = false;
+      if (autopilotActive) {
+        autopilotActive = false;
+        if (autopilotTimer) { clearTimeout(autopilotTimer); autopilotTimer = null; }
+      }
+      try { invalidateFortifyCache(); } catch (_) {}
+      try { invalidateTopMovesCache(); } catch (_) {}
+      document.getElementById('setupModal')?.classList.remove('show');
+      document.getElementById('handoffModal')?.classList.remove('show');
+      for (const id of ['advanceModal','fortifyModal','controlledBlitzModal','diplomacyModal','truceOfferModal','v5PlanModal']) {
+        document.getElementById(id)?.classList.remove('show');
+      }
+      if (!fromClientToHost && Number.isFinite(revision)) mpRevision = Math.max(mpRevision, revision);
+      mpLastStateJson = mpSerializeState(state);
+      render();
+      refreshSpeedControls?.();
+      updateVictoryConditionsPanel?.();
+    } finally {
+      mpApplyingRemote = false;
+    }
+  }
+
+  function mpCanLocalAct() {
+    if (!mpOnline()) return true;
+    if (!mpGameStarted || !state || state.gameOver) return false;
+    const cp = state.players?.[state.currentPlayer];
+    if (!cp?.isHuman) return false;
+    return mpLocalSeat === state.currentPlayer && mpAuthoritySeat === mpLocalSeat;
+  }
+
+  function mpLocalIsAuthorityRunner() {
+    return mpOnline() && mpGameStarted && mpLocalSeat != null && mpAuthoritySeat === mpLocalSeat;
+  }
+
+  function mpQueueStateBroadcast() {
+    if (!mpOnline() || !mpGameStarted || mpApplyingRemote || !state) return;
+    if (!mpLocalIsAuthorityRunner()) return;
+    if (mpStateBroadcastTimer) return;
+    mpStateBroadcastTimer = setTimeout(() => {
+      mpStateBroadcastTimer = null;
+      mpBroadcastStateIfChanged();
+    }, 20);
+  }
+
+  function mpBroadcastStateIfChanged(force) {
+    if (!mpOnline() || !mpGameStarted || mpApplyingRemote || !state) return false;
+    if (!mpLocalIsAuthorityRunner()) return false;
+    const json = mpSerializeState(state);
+    if (!json || (!force && json === mpLastStateJson)) return false;
+
+    const outgoingAuthority = mpAuthorityForSnapshot(mpAuthoritySeat, state);
+    const payloadState = JSON.parse(json);
+    mpLastStateJson = json;
+
+    if (mpHost()) {
+      mpAuthoritySeat = outgoingAuthority;
+      mpRevision++;
+      const payload = { type:'state', protocol:MP_PROTOCOL, revision:mpRevision, authoritySeat:mpAuthoritySeat, state:payloadState };
+      mpBroadcast(payload);
+      mpLastAppliedRevision = mpRevision;
+    } else if (mpClient()) {
+      mpSendSafe(mpHostConn, { type:'state', protocol:MP_PROTOCOL, authoritySeat:outgoingAuthority, state:payloadState });
+      mpAuthoritySeat = outgoingAuthority;
+    }
+    mpUpdateMultiplayerStatus();
+    return true;
+  }
+
+  function mpUpdateMultiplayerStatus() {
+    if (!mpOnline()) { mpSetStatus('Local play'); return; }
+    if (!mpGameStarted || !state) {
+      if (mpHost()) mpSetStatus(`Room ${mpRoomCode} · ${mpConnectedHumanCount()}/${mpExpectedHumans} connected`, mpConnectedHumanCount() >= mpExpectedHumans ? 'good' : 'normal');
+      return;
+    }
+    const cp = state.players?.[state.currentPlayer];
+    if (!cp) return;
+    if (cp.isHuman) {
+      const mine = state.currentPlayer === mpLocalSeat;
+      const activeConnected = mpHost()
+        ? (mpAuthoritySeat === 0 || [...mpHostConnections.values()].some(x => x.seat === mpAuthoritySeat && x.conn?.open))
+        : true;
+      if (!activeConnected) mpSetStatus(`${mpSeatLabel(mpAuthoritySeat)} disconnected — waiting to reconnect`, 'error');
+      else if (mine) mpSetStatus(`Room ${mpRoomCode} · YOUR TURN · ${cp.name}`, 'good');
+      else mpSetStatus(`Room ${mpRoomCode} · waiting for ${cp.name}`);
+    } else {
+      mpSetStatus(`Room ${mpRoomCode} · ${cp.name} is taking its turn`);
+    }
+  }
+
+  function mpInstallUI() {
+    if (document.getElementById('mpSetupBlock')) return;
+    const startBtn = document.getElementById('startBtn');
+    if (!startBtn) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #mpSetupBlock{margin:18px 0;padding:14px;border:1px solid var(--panel-border);background:rgba(74,144,217,.06)}
+      #mpSetupBlock .mp-title{font-family:'Oswald',sans-serif;font-size:11px;letter-spacing:.18em;color:var(--blue);margin-bottom:9px;text-transform:uppercase}
+      #mpSetupBlock .mp-row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+      #mpSetupBlock .mp-row input{flex:1;min-width:150px}
+      #mpSetupBlock .mp-mini{width:auto;margin:0;white-space:nowrap}
+      #mpRoomOutput{font-family:'Oswald',sans-serif;font-size:25px;letter-spacing:.18em;color:var(--accent);user-select:all}
+      #mpStatus{font-size:10px;line-height:1.5;color:var(--ink-dim);margin-top:8px;min-height:15px}
+      #mpStatus[data-kind="error"]{color:var(--red)} #mpStatus[data-kind="good"]{color:var(--green)}
+      .mp-wait-card{border:1px solid var(--blue);background:rgba(74,144,217,.08);padding:14px;margin-bottom:12px}
+      .mp-wait-card b{font-family:'Oswald',sans-serif;letter-spacing:.12em;color:var(--blue)}
+    `;
+    document.head.appendChild(style);
+
+    const block = document.createElement('div');
+    block.id = 'mpSetupBlock';
+    block.innerHTML = `
+      <div class="mp-title">◆ Play Mode</div>
+      <select id="mpModeSelect">
+        <option value="local" selected>Local / Hot-Seat</option>
+        <option value="host">Online — Host Room</option>
+        <option value="client">Online — Join Room</option>
+      </select>
+      <div id="mpHostControls" style="display:none;">
+        <div class="setup-note">Choose the total number of Human Commanders above, then create a room. The host uses seat 1.</div>
+        <div class="mp-row"><button class="btn mp-mini" id="mpCreateBtn" type="button">Create Room</button><span>ROOM:</span><strong id="mpRoomOutput">—</strong><button class="btn mp-mini" id="mpCopyBtn" type="button">Copy Code</button></div>
+      </div>
+      <div id="mpClientControls" style="display:none;">
+        <div class="setup-note">Enter the host's room code. Game settings and map seed come from the host.</div>
+        <div class="mp-row"><input id="mpJoinCode" maxlength="8" placeholder="ROOM CODE" autocomplete="off"><button class="btn mp-mini" id="mpJoinBtn" type="button">Join Room</button></div>
+      </div>
+      <div id="mpStatus">Local play</div>
+      <div class="setup-note">Online mode uses WebRTC. For friendly games only: connected players receive the synchronized game state.</div>
+    `;
+    startBtn.parentNode.insertBefore(block, startBtn);
+
+    const headerRight = document.querySelector('.header-right');
+    if (headerRight) {
+      const chip = document.createElement('span');
+      chip.id = 'mpHeaderChip';
+      chip.style.display = 'none';
+      chip.style.maxWidth = '260px';
+      chip.style.whiteSpace = 'nowrap';
+      chip.style.overflow = 'hidden';
+      chip.style.textOverflow = 'ellipsis';
+      headerRight.insertBefore(chip, headerRight.firstChild);
+    }
+
+    document.getElementById('mpModeSelect').addEventListener('change', e => {
+      if (mpGameStarted) { e.target.value = mpMode; return; }
+      const next = e.target.value;
+      mpDestroyNetwork();
+      mpMode = next;
+      mpSetStatus(next === 'local' ? 'Local play' : (next === 'host' ? 'Set Human Commanders, then create a room.' : 'Enter the host room code.'));
+      mpUpdateModeUI();
+    });
+    document.getElementById('mpCreateBtn').addEventListener('click', mpCreateRoom);
+    document.getElementById('mpJoinBtn').addEventListener('click', mpJoinRoom);
+    document.getElementById('mpJoinCode').addEventListener('input', e => { e.target.value = mpNormalizeRoomCode(e.target.value); });
+    document.getElementById('mpJoinCode').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); mpJoinRoom(); } });
+    document.getElementById('mpCopyBtn').addEventListener('click', async () => {
+      if (!mpRoomCode) return;
+      try { await navigator.clipboard.writeText(mpRoomCode); mpSetStatus(`Room code ${mpRoomCode} copied.`, 'good'); }
+      catch (_) { prompt('Copy this room code:', mpRoomCode); }
+    });
+    mpUpdateModeUI();
+  }
+
+  function mpUpdateModeUI() {
+    const sel = document.getElementById('mpModeSelect');
+    if (sel) sel.value = mpMode;
+    const hostBox = document.getElementById('mpHostControls');
+    const clientBox = document.getElementById('mpClientControls');
+    if (hostBox) hostBox.style.display = mpHost() ? '' : 'none';
+    if (clientBox) clientBox.style.display = mpClient() ? '' : 'none';
+    mpUpdateLobbyUI();
+  }
+
+  // ----- Integrate with the existing game start -----
+  const _mpBaseV5StartGame = (typeof v5StartGame === 'function') ? v5StartGame : null;
+  if (_mpBaseV5StartGame) {
+    v5StartGame = function mpStartGameWrapper() {
+      if (mpClient()) {
+        alert('Only the host starts an online game. You are connected as a player; wait for the host to begin.');
+        return;
+      }
+      if (mpHost()) {
+        if (!mpPeer || !mpRoomCode) { alert('Create the online room first.'); return; }
+        if (mpConnectedHumanCount() < mpExpectedHumans) {
+          alert(`Waiting for ${mpExpectedHumans - mpConnectedHumanCount()} more commander(s) to join room ${mpRoomCode}.`);
+          return;
+        }
+        const settings = v5ReadSetup();
+        if (settings.numHumans !== mpExpectedHumans) {
+          alert(`This room was created for ${mpExpectedHumans} human commanders. Recreate the room to change that number.`);
+          return;
+        }
+        mpGameStarted = true;
+        mpAuthoritySeat = 0; // host owns setup generation until first remote-human handoff
+        mpLastStateJson = '';
+        _mpBaseV5StartGame.apply(this, arguments);
+        if (state) {
+          state.multiplayer = { enabled:true, protocol:MP_PROTOCOL, roomCode:mpRoomCode, expectedHumans:mpExpectedHumans };
+          mpBroadcastStateIfChanged(true);
+        }
+        mpBroadcastLobby();
+        mpUpdateLobbyUI();
+        return;
+      }
+      return _mpBaseV5StartGame.apply(this, arguments);
+    };
+    document.getElementById('startBtn').onclick = v5StartGame;
+  }
+
+  // ----- Online mode has no physical-device handoff modal -----
+  const _mpBaseShowHandoff = showHandoffOverlay;
+  showHandoffOverlay = function mpShowHandoffOverlay(player) {
+    if (mpOnline()) {
+      handoffPending = false;
+      document.getElementById('handoffModal')?.classList.remove('show');
+      render();
+      // In hot-seat mode confirmHandoff() normally reveals queued truce offers.
+      // Online there is no physical handoff modal, so the local seat must do
+      // that step automatically when control comes back to this browser.
+      if (player?.id === mpLocalSeat && mpAuthoritySeat === mpLocalSeat) {
+        setTimeout(() => {
+          if (mpCanLocalAct()) { processPendingTruceOffers(); mpQueueStateBroadcast(); }
+        }, 0);
+      }
+      return;
+    }
+    return _mpBaseShowHandoff.apply(this, arguments);
+  };
+
+  // ----- Gate local game input to the assigned seat -----
+  const _mpBaseTerritoryClick = onTerritoryClick;
+  onTerritoryClick = function mpTerritoryClick(id) {
+    if (mpOnline() && !mpCanLocalAct()) return;
+    return _mpBaseTerritoryClick.apply(this, arguments);
+  };
+
+  function mpGuardAction(fn, fallback) {
+    return function guardedMultiplayerAction() {
+      if (mpOnline() && !mpCanLocalAct()) {
+        mpUpdateMultiplayerStatus();
+        return fallback;
+      }
+      return fn.apply(this, arguments);
+    };
+  }
+
+  nextPhase = mpGuardAction(nextPhase);
+  confirmAttack = mpGuardAction(confirmAttack);
+  blitzAttack = mpGuardAction(blitzAttack);
+  runControlledBlitz = mpGuardAction(runControlledBlitz);
+  confirmAdvance = mpGuardAction(confirmAdvance);
+  confirmFortify = mpGuardAction(confirmFortify);
+  autoDeployHumanOpening = mpGuardAction(autoDeployHumanOpening);
+  humanTradeCards = mpGuardAction(humanTradeCards);
+  undoLastPlacement = mpGuardAction(undoLastPlacement);
+  buyResearch = mpGuardAction(buyResearch, false);
+  startFinalResearch = mpGuardAction(startFinalResearch, false);
+  promoteSpecialist = mpGuardAction(promoteSpecialist, false);
+  diplomacyAction = mpGuardAction(diplomacyAction);
+  respondTruceOffer = mpGuardAction(respondTruceOffer);
+  advisorDoIt = mpGuardAction(advisorDoIt);
+  if (typeof v5ExecuteChoice === 'function') v5ExecuteChoice = mpGuardAction(v5ExecuteChoice);
+  if (typeof v5ExecutePlan === 'function') v5ExecutePlan = mpGuardAction(v5ExecutePlan);
+  if (typeof autopilotStart === 'function') autopilotStart = mpGuardAction(autopilotStart);
+
+
+  // Loading a local browser save would fork an online room. Block only the
+  // load/import paths; ordinary Save remains useful as a personal backup.
+  if (typeof loadGame === 'function') {
+    const _mpBaseLoadGame = loadGame;
+    loadGame = function mpLoadGameGuard() {
+      if (mpOnline()) { alert('Loading a local save is disabled during an online room.'); return false; }
+      return _mpBaseLoadGame.apply(this, arguments);
+    };
+  }
+  if (typeof loadFromSlot === 'function') {
+    const _mpBaseLoadFromSlot = loadFromSlot;
+    loadFromSlot = function mpLoadFromSlotGuard() {
+      if (mpOnline()) { alert('Loading a local save is disabled during an online room.'); return false; }
+      return _mpBaseLoadFromSlot.apply(this, arguments);
+    };
+  }
+
+  // ----- Hide the active opponent's private tactical panel -----
+  const _mpBaseRenderPanel = renderPanel;
+  renderPanel = function mpRenderPanel() {
+    _mpBaseRenderPanel.apply(this, arguments);
+    if (!mpOnline() || !mpGameStarted || !state) return;
+    const cp = state.players?.[state.currentPlayer];
+    if (cp?.isHuman && state.currentPlayer !== mpLocalSeat) {
+      const box = document.getElementById('selectionBox');
+      const btns = document.getElementById('actionButtons');
+      if (box) box.innerHTML = `<div class="mp-wait-card"><b>ONLINE COMMAND TRANSFER</b><div style="margin-top:7px;font-size:11px;color:var(--ink-dim);line-height:1.55;">Waiting for ${escapeHtml(cp.name)}. The public battlefield remains visible, but that commander's tactical panel is hidden on your screen.</div></div>`;
+      if (btns) btns.innerHTML = '';
+    }
+  };
+
+  // ----- Broadcast snapshots whenever the authority renders a changed state -----
+  const _mpBaseRender = render;
+  render = function mpRender() {
+    const out = _mpBaseRender.apply(this, arguments);
+    if (mpOnline()) {
+      mpUpdateMultiplayerStatus();
+      mpQueueStateBroadcast();
+    }
+    return out;
+  };
+
+  // Block game keyboard shortcuts while another human owns the turn. This is
+  // capture-phase so existing shortcut handlers never see the event.
+  document.addEventListener('keydown', e => {
+    if (!mpOnline() || !mpGameStarted || !state) return;
+    const cp = state.players?.[state.currentPlayer];
+    if (cp?.isHuman && !mpCanLocalAct()) {
+      const tag = (e.target?.tagName || '').toUpperCase();
+      if (tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA') {
+        const gameKeys = new Set(['a','f','b','d','?','escape',' ']);
+        if (gameKeys.has(String(e.key).toLowerCase())) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      }
+    }
+  }, true);
+
+  // Public helpers for troubleshooting from the browser console.
+  window.BorderforgeMultiplayer = {
+    get status() {
+      return { mode:mpMode, roomCode:mpRoomCode, localSeat:mpLocalSeat, authoritySeat:mpAuthoritySeat, expectedHumans:mpExpectedHumans, started:mpGameStarted, revision:mpRevision, status:mpLastStatus };
+    },
+    forceSync() { return mpBroadcastStateIfChanged(true); },
+    leave() {
+      mpDestroyNetwork();
+      mpMode = 'local';
+      mpSetStatus('Local play');
+      mpUpdateModeUI();
+    }
+  };
+
+  mpInstallUI();
+})();
+
 </script>
 </body>
 </html>
