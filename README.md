@@ -8,5 +8,5 @@ A browser-based tactical conquest strategy game
 
 ## Game Documentation
 
-* 📖 **[Player Manual & Rules](BORDERFORGE_PLAYER_MANUAL.md)** — Complete rules for terrain, research, specialists, cards, and tactical systems[cite: 6].
-* ⚡ **[Online Multiplayer Quick Start](ONLINE_MULTIPLAYER_QUICK_START.md)** — How to host or join a WebRTC room with friends[cite: 7].
+* 📖 **[Player Manual & Rules](BORDERFORGE_PLAYER_MANUAL.md)** — Complete rules for terrain, research, specialists, cards, and tactical systems.
+* ⚡ **[Online Multiplayer Quick Start](ONLINE_MULTIPLAYER_QUICK_START.md)** — How to host or join a WebRTC room with friends.
